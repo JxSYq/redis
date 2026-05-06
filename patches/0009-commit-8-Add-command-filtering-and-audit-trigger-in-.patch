@@ -1,0 +1,314 @@
+From 877df095e6ed3e8ca96b55c04645df447d8f0996 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 19:01:44 +0800
+Subject: [PATCH 09/12] commit 8: Add command filtering and audit trigger in
+ call()
+
+- Add audit_start_time field to client struct
+- Implement auditShouldLog(): checks audit_log_enabled, CMD_WRITE
+  flag, and customer-command-list (case-insensitive dict lookup)
+- Implement auditLogCommand(): filters errors/empty responses,
+  creates entry, computes use_time in microseconds, pushes to queue
+- Add auditRebuildCustomerCommandDict() for customer command list
+- Hook into call() before cmd->proc() for start time and before
+  afterCommand() for audit trigger
+- Write commands auto-logged, read commands only if in customer list
+- Failed commands (error responses) are excluded
+- Add update callback for dynamic customer-command-list changes
+- Add Tcl functional tests
+---
+ src/audit.c              | 108 ++++++++++++++++++++++++++++++++++++++-
+ src/audit.h              |   7 +++
+ src/config.c             |   2 +-
+ src/server.c             |   5 ++
+ src/server.h             |   2 +
+ tests/unit/audit-log.tcl |  64 +++++++++++++++++++++++
+ 6 files changed, 186 insertions(+), 2 deletions(-)
+
+diff --git a/src/audit.c b/src/audit.c
+index 6a0ac674c..b2ff5fedd 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -271,6 +271,14 @@ int auditLogQueueLengthUpdate(long long val, long long prev, const char **err) {
+     return 1;
+ }
+ 
++int auditCustomerCommandListUpdate(char *val, char *prev, const char **err) {
++    UNUSED(val);
++    UNUSED(prev);
++    UNUSED(err);
++    auditRebuildCustomerCommandDict();
++    return 1;
++}
++
+ /* --------------------------------------------------------------------------
+  * Command type mapping
+  * -------------------------------------------------------------------------- */
+@@ -989,7 +997,7 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
+  * -------------------------------------------------------------------------- */
+ 
+ /* Get nanosecond-precision Unix timestamp. */
+-static long long auditNanoTime(void) {
++long long auditNanoTime(void) {
+     struct timespec ts;
+     clock_gettime(CLOCK_REALTIME, &ts);
+     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+@@ -1165,6 +1173,104 @@ void auditFreeEntry(auditLogEntry *entry) {
+     zfree(entry);
+ }
+ 
++/* --------------------------------------------------------------------------
++ * Command filtering and audit trigger
++ * -------------------------------------------------------------------------- */
++
++static dict *audit_customer_command_dict = NULL;
++
++static dictType customerCommandDictType = {
++    dictSdsCaseHash,
++    NULL,
++    NULL,
++    dictSdsKeyCaseCompare,
++    dictSdsDestructor,
++    NULL,
++    NULL
++};
++
++/* Rebuild the customer command dictionary from the config string. */
++void auditRebuildCustomerCommandDict(void) {
++    if (audit_customer_command_dict) {
++        dictRelease(audit_customer_command_dict);
++    }
++    audit_customer_command_dict = dictCreate(&customerCommandDictType, NULL);
++
++    if (!server.audit_log_customer_command_list ||
++        server.audit_log_customer_command_list[0] == '\0')
++        return;
++
++    sds copy = sdsnew(server.audit_log_customer_command_list);
++    int argc;
++    sds *argv = sdssplitargs(copy, &argc);
++    sdsfree(copy);
++
++    if (argv) {
++        for (int i = 0; i < argc; i++) {
++            sds upper = sdsdup(argv[i]);
++            sdstoupper(upper);
++            dictAdd(audit_customer_command_dict, upper, NULL);
++        }
++        sdsfreesplitres(argv, argc);
++    }
++}
++
++/* Check if the command should be audited. */
++int auditShouldLog(client *c) {
++    if (!server.audit_log_enabled) return 0;
++    if (!c->cmd) return 0;
++
++    /* Write commands */
++    if (c->cmd->flags & CMD_WRITE) return 1;
++
++    /* Customer command list */
++    if (audit_customer_command_dict) {
++        sds upper = sdsnew(c->argv[0]->ptr);
++        sdstoupper(upper);
++        dictEntry *de = dictFind(audit_customer_command_dict, upper);
++        sdsfree(upper);
++        if (de) return 1;
++    }
++
++    return 0;
++}
++
++/* Check if the response is an error. Called after command execution. */
++static int auditResponseIsError(client *c) {
++    if (!c->bufpos && listLength(c->reply) == 0) return 0;
++    /* Check if the reply starts with '-' (RESP error prefix) */
++    if (c->bufpos > 0 && c->buf[0] == '-') return 1;
++    /* For reply list, check first element */
++    if (listLength(c->reply) > 0) {
++        listNode *ln = listFirst(c->reply);
++        clientReplyBlock *o = ln->value;
++        if (o->used > 0 && o->buf[0] == '-') return 1;
++    }
++    return 0;
++}
++
++/* Check if the response is empty. */
++static int auditResponseIsEmpty(client *c) {
++    return (c->bufpos == 0 && listLength(c->reply) == 0);
++}
++
++/* Trigger audit logging for a command after execution. */
++void auditLogCommand(client *c) {
++    if (!auditShouldLog(c)) return;
++    if (auditResponseIsError(c)) return;
++    if (auditResponseIsEmpty(c)) return;
++
++    auditLogEntry *entry = auditCreateEntry(c);
++    entry->use_time = (auditNanoTime() - c->audit_start_time) / 1000;
++
++    /* Serialize to JSON before pushing */
++    entry->raw = auditEntryToJSON(entry);
++
++    if (!auditLogQueuePush(entry)) {
++        auditFreeEntry(entry);
++    }
++}
++
+ /* --------------------------------------------------------------------------
+  * Consumer thread
+  * -------------------------------------------------------------------------- */
+diff --git a/src/audit.h b/src/audit.h
+index 9ae99d2fd..8f109b8ff 100644
+--- a/src/audit.h
++++ b/src/audit.h
+@@ -56,6 +56,7 @@ void auditLogFileSwitch(const char *newPath);
+ int auditLogEnabledUpdate(int val, int prev, const char **err);
+ int auditLogPathUpdate(char *val, char *prev, const char **err);
+ int auditLogQueueLengthUpdate(long long val, long long prev, const char **err);
++int auditCustomerCommandListUpdate(char *val, char *prev, const char **err);
+ 
+ /* Command type mapping */
+ void auditCommandTypeInit(void);
+@@ -73,4 +74,10 @@ auditLogEntry *auditCreateEntry(client *c);
+ sds auditEntryToJSON(auditLogEntry *entry);
+ void auditFreeEntry(auditLogEntry *entry);
+ 
++/* Command filtering and audit trigger */
++void auditRebuildCustomerCommandDict(void);
++int auditShouldLog(client *c);
++void auditLogCommand(client *c);
++long long auditNanoTime(void);
++
+ #endif /* __AUDIT_H */
+diff --git a/src/config.c b/src/config.c
+index 25f78af4c..5078ce7ad 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -2572,7 +2572,7 @@ standardConfig configs[] = {
+     createStringConfig("audit-log-path", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.audit_log_path, "", NULL, auditLogPathUpdate),
+     createBoolConfig("audit-log-encrypt-enabled", NULL, MODIFIABLE_CONFIG, server.audit_log_encrypt_enabled, 1, NULL, NULL),
+     createIntConfig("audit-log-queue-length", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.audit_log_queue_length, 100000, INTEGER_CONFIG, NULL, auditLogQueueLengthUpdate),
+-    createStringConfig("audit-log-customer-command-list", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.audit_log_customer_command_list, "", NULL, NULL),
++    createStringConfig("audit-log-customer-command-list", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.audit_log_customer_command_list, "", NULL, auditCustomerCommandListUpdate),
+     createLongLongConfig("audit-log-abort-count", NULL, IMMUTABLE_CONFIG, 0, LLONG_MAX, server.audit_log_abort_count, 0, INTEGER_CONFIG, NULL, NULL),
+ 
+     /* NULL Terminator */
+diff --git a/src/server.c b/src/server.c
+index 7a3cb7399..ada50f763 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -3380,6 +3380,7 @@ void initServer(void) {
+     slowlogInit();
+     latencyMonitorInit();
+     auditCommandTypeInit();
++    auditRebuildCustomerCommandDict();
+ 
+     /* Initialize ACL default password if it exists */
+     ACLUpdateDefaultUserPassword(server.requirepass);
+@@ -3749,6 +3750,7 @@ void call(client *c, int flags) {
+         monotonic_start = getMonotonicUs();
+ 
+     server.in_nested_call++;
++    c->audit_start_time = auditNanoTime();
+     c->cmd->proc(c);
+     server.in_nested_call--;
+ 
+@@ -3939,6 +3941,9 @@ void call(client *c, int flags) {
+     if (zmalloc_used > server.stat_peak_memory)
+         server.stat_peak_memory = zmalloc_used;
+ 
++    /* Audit log */
++    auditLogCommand(c);
++
+     /* Do some maintenance job and cleanup */
+     afterCommand(c);
+ }
+diff --git a/src/server.h b/src/server.h
+index 43b6a779c..bbef4e24b 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -955,6 +955,8 @@ typedef struct client {
+     /* Response buffer */
+     int bufpos;
+     char buf[PROTO_REPLY_CHUNK_BYTES];
++    /* Audit log */
++    long long audit_start_time; /* Command start time for audit (nanoseconds) */
+ } client;
+ 
+ struct saveparam {
+diff --git a/tests/unit/audit-log.tcl b/tests/unit/audit-log.tcl
+index b0cdcb83f..e910aa051 100644
+--- a/tests/unit/audit-log.tcl
++++ b/tests/unit/audit-log.tcl
+@@ -411,3 +411,67 @@ start_server {tags {"audit-log"}} {
+         assert_match {*"client_type":"0"*} $json
+     }
+ }
++
++start_server {tags {"audit-log"}} {
++    test {Audit: write commands generate log when enabled} {
++        r config set audit-log-enabled yes
++        r config set audit-log-path /tmp/test_audit_write.log
++        r SET audit_write_key audit_write_val
++        after 200
++        set fp [open /tmp/test_audit_write.log r]
++        set content [read $fp]
++        close $fp
++        assert_match {*"command_name":"SET"*} $content
++        assert_match {*"command_keys":\["audit_write_key"\]*} $content
++        file delete /tmp/test_audit_write.log
++    }
++
++    test {Audit: read commands NOT logged by default} {
++        r config set audit-log-path /tmp/test_audit_read.log
++        r GET audit_write_key
++        after 200
++        assert {![file exists /tmp/test_audit_read.log] || [file size /tmp/test_audit_read.log] == 0}
++        file delete /tmp/test_audit_read.log
++    }
++
++    test {Audit: customer command list adds read commands} {
++        r config set audit-log-customer-command-list "GET"
++        r config set audit-log-path /tmp/test_audit_cust.log
++        r GET audit_write_key
++        after 200
++        set fp [open /tmp/test_audit_cust.log r]
++        set content [read $fp]
++        close $fp
++        assert_match {*"command_name":"GET"*} $content
++        file delete /tmp/test_audit_cust.log
++        r config set audit-log-customer-command-list ""
++    }
++
++    test {Audit: failed commands NOT logged} {
++        r config set audit-log-path /tmp/test_audit_fail.log
++        catch {r INCR audit_write_key} err
++        after 200
++        assert {![file exists /tmp/test_audit_fail.log] || [file size /tmp/test_audit_fail.log] == 0}
++        file delete /tmp/test_audit_fail.log
++    }
++
++    test {Audit: disabled stops logging} {
++        r config set audit-log-enabled yes
++        r config set audit-log-path /tmp/test_audit_disable.log
++        r SET audit_key1 val1
++        after 200
++        assert {[file exists /tmp/test_audit_disable.log]}
++        r config set audit-log-enabled no
++        r SET audit_key2 val2
++        after 200
++        set fp [open /tmp/test_audit_disable.log r]
++        set content [read $fp]
++        close $fp
++        # Should only contain audit_key1, not audit_key2
++        assert {[string first "audit_key2" $content] == -1}
++        file delete /tmp/test_audit_disable.log
++    }
++
++    r config set audit-log-enabled no
++    r config set audit-log-path ""
++}
+-- 
+2.43.0
+

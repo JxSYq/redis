@@ -1,0 +1,149 @@
+From b5130600c7f04784240fff6dd14b753e11a43dd9 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 17:30:17 +0800
+Subject: [PATCH 05/12] commit 4 tests: Add audit-type debug command and Tcl
+ test cases
+
+- Add DEBUG AUDIT-TYPE <command> subcommand to expose
+  auditGetCommandType() for testing
+- Add comprehensive Tcl test cases covering all 22 categories
+- Test case-insensitive lookup behavior
+- Test unknown command returns 'undefined'
+---
+ src/debug.c              |   5 ++
+ tests/unit/audit-log.tcl | 106 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 111 insertions(+)
+
+diff --git a/src/debug.c b/src/debug.c
+index bb76c5d17..940e18b55 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -899,6 +899,11 @@ NULL
+     } else if (!strcasecmp(c->argv[1]->ptr,"pause-cron") && c->argc == 3) {
+         server.pause_cron = atoi(c->argv[2]->ptr);
+         addReply(c,shared.ok);
++    } else if (!strcasecmp(c->argv[1]->ptr,"audit-type") &&
++               c->argc == 3)
++    {
++        const char *type = auditGetCommandType(c->argv[2]->ptr);
++        addReplyBulkCString(c, type);
+     } else {
+         addReplySubcommandSyntaxError(c);
+         return;
+diff --git a/tests/unit/audit-log.tcl b/tests/unit/audit-log.tcl
+index c4a47acb6..2042d99f4 100644
+--- a/tests/unit/audit-log.tcl
++++ b/tests/unit/audit-log.tcl
+@@ -63,3 +63,109 @@ start_server {tags {"audit-log"}} {
+         set _ $err
+     } {ERR*Unsupported CONFIG*}
+ }
++
++start_server {tags {"audit-log"}} {
++    test {DEBUG AUDIT-TYPE: string commands} {
++        assert_equal "string" [r debug audit-type SET]
++        assert_equal "string" [r debug audit-type GET]
++        assert_equal "string" [r debug audit-type MSET]
++    }
++
++    test {DEBUG AUDIT-TYPE: hash commands} {
++        assert_equal "hash" [r debug audit-type HGET]
++        assert_equal "hash" [r debug audit-type HSET]
++        assert_equal "hash" [r debug audit-type HDEL]
++    }
++
++    test {DEBUG AUDIT-TYPE: list commands} {
++        assert_equal "list" [r debug audit-type LPUSH]
++        assert_equal "list" [r debug audit-type RPOP]
++        assert_equal "list" [r debug audit-type BLPOP]
++    }
++
++    test {DEBUG AUDIT-TYPE: set commands} {
++        assert_equal "set" [r debug audit-type SADD]
++        assert_equal "set" [r debug audit-type SMEMBERS]
++    }
++
++    test {DEBUG AUDIT-TYPE: sorted-set commands} {
++        assert_equal "sorted-set" [r debug audit-type ZADD]
++        assert_equal "sorted-set" [r debug audit-type ZRANGE]
++    }
++
++    test {DEBUG AUDIT-TYPE: bitmap commands} {
++        assert_equal "bitmap" [r debug audit-type BITCOUNT]
++        assert_equal "bitmap" [r debug audit-type SETBIT]
++    }
++
++    test {DEBUG AUDIT-TYPE: hyperloglog commands} {
++        assert_equal "hyperloglog" [r debug audit-type PFADD]
++        assert_equal "hyperloglog" [r debug audit-type PFCOUNT]
++    }
++
++    test {DEBUG AUDIT-TYPE: geo commands} {
++        assert_equal "geo" [r debug audit-type GEOADD]
++        assert_equal "geo" [r debug audit-type GEODIST]
++    }
++
++    test {DEBUG AUDIT-TYPE: stream commands} {
++        assert_equal "stream" [r debug audit-type XADD]
++        assert_equal "stream" [r debug audit-type XREAD]
++    }
++
++    test {DEBUG AUDIT-TYPE: pubsub commands} {
++        assert_equal "pubsub" [r debug audit-type PUBLISH]
++        assert_equal "pubsub" [r debug audit-type SUBSCRIBE]
++    }
++
++    test {DEBUG AUDIT-TYPE: scripting commands} {
++        assert_equal "scripting" [r debug audit-type EVAL]
++        assert_equal "scripting" [r debug audit-type EVALSHA]
++    }
++
++    test {DEBUG AUDIT-TYPE: transactions commands} {
++        assert_equal "transactions" [r debug audit-type MULTI]
++        assert_equal "transactions" [r debug audit-type EXEC]
++    }
++
++    test {DEBUG AUDIT-TYPE: connection commands} {
++        assert_equal "connection" [r debug audit-type PING]
++        assert_equal "connection" [r debug audit-type SELECT]
++    }
++
++    test {DEBUG AUDIT-TYPE: server commands} {
++        assert_equal "server" [r debug audit-type INFO]
++        assert_equal "server" [r debug audit-type CONFIG]
++    }
++
++    test {DEBUG AUDIT-TYPE: generic commands} {
++        assert_equal "generic" [r debug audit-type DEL]
++        assert_equal "generic" [r debug audit-type EXISTS]
++    }
++
++    test {DEBUG AUDIT-TYPE: cluster commands} {
++        assert_equal "cluster" [r debug audit-type CLUSTER]
++    }
++
++    test {DEBUG AUDIT-TYPE: module commands (bf/cf/json/search/timeseries/topk)} {
++        assert_equal "bf" [r debug audit-type BF.ADD]
++        assert_equal "cf" [r debug audit-type CF.ADD]
++        assert_equal "json" [r debug audit-type JSON.SET]
++        assert_equal "search" [r debug audit-type FT.SEARCH]
++        assert_equal "timeseries" [r debug audit-type TS.ADD]
++        assert_equal "topk" [r debug audit-type TOPK.ADD]
++    }
++
++    test {DEBUG AUDIT-TYPE: case insensitive lookup} {
++        assert_equal "string" [r debug audit-type set]
++        assert_equal "string" [r debug audit-type Set]
++        assert_equal "hash" [r debug audit-type hget]
++        assert_equal "hash" [r debug audit-type Hget]
++        assert_equal "sorted-set" [r debug audit-type zadd]
++    }
++
++    test {DEBUG AUDIT-TYPE: unknown command returns undefined} {
++        assert_equal "undefined" [r debug audit-type UNKNOWNCMD]
++        assert_equal "undefined" [r debug audit-type NOTACMD]
++    }
++}
+-- 
+2.43.0
+

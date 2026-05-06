@@ -1,0 +1,401 @@
+From c15516414d6f6ffd9aa83db1a583ad0eac61b30c Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 18:00:09 +0800
+Subject: [PATCH 08/12] commit 7: Add audit entry creation and JSON
+ serialization
+
+- Expand auditLogEntry with all 15 business fields per design spec
+- Implement auditCreateEntry() to build entry from client context:
+  time (nanoseconds), instance_id (runid), proxy/server_addr, role,
+  client_addr/type, user, db, command_name/type, command_keys,
+  command_param (with encryption), use_time, extend
+- Implement auditEntryToJSON() for manual JSON serialization
+  with proper escaping of \, ", and control characters
+- Implement auditFreeEntry() to free all SDS fields
+- Update consumer thread and queue cleanup to use auditFreeEntry
+- Add DEBUG AUDIT-ENTRY command and Tcl tests
+---
+ src/audit.c              | 191 +++++++++++++++++++++++++++++++++++++--
+ src/audit.h              |  30 +++++-
+ src/debug.c              |  14 ++-
+ tests/unit/audit-log.tcl |  58 ++++++++++++
+ 4 files changed, 285 insertions(+), 8 deletions(-)
+
+diff --git a/src/audit.c b/src/audit.c
+index b16d0b388..6a0ac674c 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -4,6 +4,7 @@
+ #include <signal.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <time.h>
+ 
+ /* Ring buffer queue for asynchronous audit logging */
+ typedef struct auditLogQueue {
+@@ -121,8 +122,7 @@ void auditLogQueueDestroy(void) {
+     for (int i = 0; i < audit_queue->count; i++) {
+         int idx = (audit_queue->head + i) % audit_queue->capacity;
+         if (audit_queue->entries[idx] != NULL) {
+-            sdsfree(audit_queue->entries[idx]->raw);
+-            zfree(audit_queue->entries[idx]);
++            auditFreeEntry(audit_queue->entries[idx]);
+             audit_queue->entries[idx] = NULL;
+         }
+     }
+@@ -172,8 +172,7 @@ void auditLogQueueRebuild(int new_capacity) {
+         for (int i = 0; i < dropped; i++) {
+             int idx = (audit_queue->head + i) % audit_queue->capacity;
+             if (audit_queue->entries[idx] != NULL) {
+-                sdsfree(audit_queue->entries[idx]->raw);
+-                zfree(audit_queue->entries[idx]);
++                auditFreeEntry(audit_queue->entries[idx]);
+             }
+         }
+         server.audit_log_abort_count += dropped;
+@@ -985,6 +984,187 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
+     return result;
+ }
+ 
++/* --------------------------------------------------------------------------
++ * Audit entry creation and JSON serialization
++ * -------------------------------------------------------------------------- */
++
++/* Get nanosecond-precision Unix timestamp. */
++static long long auditNanoTime(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++}
++
++/* Escape a string for JSON (handle " \ and control chars). */
++static sds auditEscapeJSON(const char *str, size_t len) {
++    sds escaped = sdsempty();
++    for (size_t i = 0; i < len; i++) {
++        char c = str[i];
++        switch (c) {
++            case '"': escaped = sdscatlen(escaped, "\\\"", 2); break;
++            case '\\': escaped = sdscatlen(escaped, "\\\\", 2); break;
++            case '\n': escaped = sdscatlen(escaped, "\\n", 2); break;
++            case '\r': escaped = sdscatlen(escaped, "\\r", 2); break;
++            case '\t': escaped = sdscatlen(escaped, "\\t", 2); break;
++            case '\b': escaped = sdscatlen(escaped, "\\b", 2); break;
++            case '\f': escaped = sdscatlen(escaped, "\\f", 2); break;
++            default:
++                if ((unsigned char)c < 0x20) {
++                    char buf[8];
++                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
++                    escaped = sdscat(escaped, buf);
++                } else {
++                    escaped = sdscatlen(escaped, &c, 1);
++                }
++                break;
++        }
++    }
++    return escaped;
++}
++
++/* Create an audit log entry from a client command context. */
++auditLogEntry *auditCreateEntry(client *c) {
++    auditLogEntry *entry = zmalloc(sizeof(auditLogEntry));
++    memset(entry, 0, sizeof(auditLogEntry));
++
++    entry->time = auditNanoTime();
++
++    entry->instance_id = sdsnew(server.runid);
++
++    char addr[256];
++    anetFormatAddr(addr, sizeof(addr),
++        server.bindaddr_count ? server.bindaddr[0] : "*", server.port);
++    entry->proxy_addr = sdsnew(addr);
++    entry->server_addr = sdsnew(addr);
++
++    entry->role = sdsnew(server.masterhost ? "slave" : "master");
++
++    if (c->peerid) {
++        entry->client_addr = sdsnew(c->peerid);
++    } else {
++        entry->client_addr = sdsempty();
++    }
++
++    if (c->flags & CLIENT_MASTER) {
++        entry->client_type = sdsnew(AUDIT_CLIENT_TYPE_MASTER);
++    } else if (c->flags & CLIENT_SLAVE) {
++        entry->client_type = sdsnew(AUDIT_CLIENT_TYPE_SLAVE);
++    } else if (c->flags & CLIENT_PUBSUB) {
++        entry->client_type = sdsnew(AUDIT_CLIENT_TYPE_PUBSUB);
++    } else {
++        entry->client_type = sdsnew(AUDIT_CLIENT_TYPE_NORMAL);
++    }
++
++    if (c->user && c->user->name) {
++        entry->user = sdsnew(c->user->name);
++    } else {
++        entry->user = sdsnew("default");
++    }
++
++    entry->db = c->db ? c->db->id : 0;
++
++    entry->command_name = sdsnew(c->argv[0]->ptr);
++    entry->command_type = sdsnew(auditGetCommandType(c->argv[0]->ptr));
++
++    entry->command_keys = auditExtractKeys(c, &entry->num_keys);
++    entry->command_param = auditBuildCommandParam(c, entry->command_keys,
++        entry->num_keys, server.audit_log_encrypt_enabled);
++
++    entry->use_time = 0;
++    entry->extend = sdsempty();
++
++    return entry;
++}
++
++/* Serialize an audit entry to a JSON string. */
++sds auditEntryToJSON(auditLogEntry *entry) {
++    sds json = sdsempty();
++    sds escaped;
++
++    json = sdscatprintf(json,
++        "{\"time\":%lld", entry->time);
++
++    escaped = auditEscapeJSON(entry->instance_id, sdslen(entry->instance_id));
++    json = sdscatprintf(json, ",\"instance_id\":\"%s\"", escaped);
++    sdsfree(escaped);
++
++    escaped = auditEscapeJSON(entry->proxy_addr, sdslen(entry->proxy_addr));
++    json = sdscatprintf(json, ",\"proxy_addr\":\"%s\"", escaped);
++    sdsfree(escaped);
++
++    escaped = auditEscapeJSON(entry->server_addr, sdslen(entry->server_addr));
++    json = sdscatprintf(json, ",\"server_addr\":\"%s\"", escaped);
++    sdsfree(escaped);
++
++    json = sdscatprintf(json, ",\"role\":\"%s\"", entry->role);
++
++    escaped = auditEscapeJSON(entry->client_addr, sdslen(entry->client_addr));
++    json = sdscatprintf(json, ",\"client_addr\":\"%s\"", escaped);
++    sdsfree(escaped);
++
++    json = sdscatprintf(json, ",\"client_type\":\"%s\"", entry->client_type);
++
++    escaped = auditEscapeJSON(entry->user, sdslen(entry->user));
++    json = sdscatprintf(json, ",\"user\":\"%s\"", escaped);
++    sdsfree(escaped);
++
++    json = sdscatprintf(json, ",\"db\":%d", entry->db);
++
++    escaped = auditEscapeJSON(entry->command_name, sdslen(entry->command_name));
++    json = sdscatprintf(json, ",\"command_name\":\"%s\"", escaped);
++    sdsfree(escaped);
++
++    json = sdscatprintf(json, ",\"command_type\":\"%s\"", entry->command_type);
++
++    json = sdscat(json, ",\"command_keys\":[");
++    for (int i = 0; i < entry->num_keys; i++) {
++        if (i > 0) json = sdscatlen(json, ",", 1);
++        escaped = auditEscapeJSON(entry->command_keys[i],
++            sdslen(entry->command_keys[i]));
++        json = sdscatprintf(json, "\"%s\"", escaped);
++        sdsfree(escaped);
++    }
++    json = sdscatlen(json, "]", 1);
++
++    escaped = auditEscapeJSON(entry->command_param,
++        sdslen(entry->command_param));
++    json = sdscatprintf(json, ",\"command_param\":\"%s\"", escaped);
++    sdsfree(escaped);
++
++    json = sdscatprintf(json, ",\"use_time\":%lld", entry->use_time);
++
++    escaped = auditEscapeJSON(entry->extend, sdslen(entry->extend));
++    json = sdscatprintf(json, ",\"extend\":\"%s\"", escaped);
++    sdsfree(escaped);
++
++    json = sdscatlen(json, "}\n", 2);
++    return json;
++}
++
++/* Free an audit log entry and all its fields. */
++void auditFreeEntry(auditLogEntry *entry) {
++    if (!entry) return;
++    sdsfree(entry->instance_id);
++    sdsfree(entry->proxy_addr);
++    sdsfree(entry->server_addr);
++    sdsfree(entry->role);
++    sdsfree(entry->client_addr);
++    sdsfree(entry->client_type);
++    sdsfree(entry->user);
++    sdsfree(entry->command_name);
++    sdsfree(entry->command_type);
++    if (entry->command_keys) {
++        for (int i = 0; i < entry->num_keys; i++) {
++            sdsfree(entry->command_keys[i]);
++        }
++        zfree(entry->command_keys);
++    }
++    sdsfree(entry->command_param);
++    sdsfree(entry->extend);
++    sdsfree(entry->raw);
++    zfree(entry);
++}
++
+ /* --------------------------------------------------------------------------
+  * Consumer thread
+  * -------------------------------------------------------------------------- */
+@@ -1015,8 +1195,7 @@ static void *auditLogThreadMain(void *arg) {
+         if (server.audit_log_enabled) {
+             auditLogFileWrite(entry->raw, sdslen(entry->raw));
+         }
+-        sdsfree(entry->raw);
+-        zfree(entry);
++        auditFreeEntry(entry);
+     }
+ 
+     return NULL;
+diff --git a/src/audit.h b/src/audit.h
+index 05a69a115..9ae99d2fd 100644
+--- a/src/audit.h
++++ b/src/audit.h
+@@ -4,8 +4,31 @@
+ 
+ #include "sds.h"
+ 
+-/* Audit log entry. At this stage, it only contains the JSON string. */
++#define AUDIT_CLIENT_TYPE_NORMAL "0"
++#define AUDIT_CLIENT_TYPE_SLAVE  "1"
++#define AUDIT_CLIENT_TYPE_PUBSUB "2"
++#define AUDIT_CLIENT_TYPE_MASTER "3"
++
+ typedef struct auditLogEntry {
++    /* Business fields */
++    long long time;             /* Command arrival time (nanoseconds since epoch) */
++    sds instance_id;            /* Redis instance identifier */
++    sds proxy_addr;             /* Redis listen address (ip:port) */
++    sds server_addr;            /* Actual server address */
++    sds role;                   /* "master" or "slave" */
++    sds client_addr;            /* Client remote address (ip:port) */
++    sds client_type;            /* Client type code */
++    sds user;                   /* Authenticated username */
++    int db;                     /* Selected database number */
++    sds command_name;           /* Command name (e.g. SET) */
++    sds command_type;           /* Command type (e.g. string) */
++    int num_keys;               /* Number of keys */
++    sds *command_keys;          /* Array of key names */
++    sds command_param;          /* Full command param string */
++    long long use_time;         /* Command execution time (microseconds) */
++    sds extend;                 /* Extension info (isTrans for transactions) */
++
++    /* Serialized output */
+     sds raw;                    /* JSON serialized audit log line */
+ } auditLogEntry;
+ 
+@@ -45,4 +68,9 @@ void auditFreeKeys(sds *keys, int numkeys);
+ /* Command param construction, truncation and encryption */
+ sds auditBuildCommandParam(client *c, sds *keys, int numkeys, int encryptEnabled);
+ 
++/* Audit entry lifecycle */
++auditLogEntry *auditCreateEntry(client *c);
++sds auditEntryToJSON(auditLogEntry *entry);
++void auditFreeEntry(auditLogEntry *entry);
++
+ #endif /* __AUDIT_H */
+diff --git a/src/debug.c b/src/debug.c
+index 3a137c64b..410a96516 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -924,7 +924,6 @@ NULL
+     } else if (!strcasecmp(c->argv[1]->ptr,"audit-param") &&
+                c->argc >= 5)
+     {
+-        /* DEBUG AUDIT-PARAM <encrypt:0|1> CMD arg1 arg2 ... */
+         int encryptEnabled = atoi(c->argv[2]->ptr);
+         robj **orig_argv = c->argv;
+         int orig_argc = c->argc;
+@@ -937,6 +936,19 @@ NULL
+         c->argv = orig_argv;
+         c->argc = orig_argc;
+         addReplyBulkSds(c, param);
++    } else if (!strcasecmp(c->argv[1]->ptr,"audit-entry") &&
++               c->argc >= 3)
++    {
++        robj **orig_argv = c->argv;
++        int orig_argc = c->argc;
++        c->argv = c->argv + 2;
++        c->argc = c->argc - 2;
++        auditLogEntry *entry = auditCreateEntry(c);
++        sds json = auditEntryToJSON(entry);
++        auditFreeEntry(entry);
++        c->argv = orig_argv;
++        c->argc = orig_argc;
++        addReplyBulkSds(c, json);
+     } else {
+         addReplySubcommandSyntaxError(c);
+         return;
+diff --git a/tests/unit/audit-log.tcl b/tests/unit/audit-log.tcl
+index f25751d2e..b0cdcb83f 100644
+--- a/tests/unit/audit-log.tcl
++++ b/tests/unit/audit-log.tcl
+@@ -353,3 +353,61 @@ start_server {tags {"audit-log"}} {
+         assert_equal "BLPOP k1 k2 *" [r debug audit-param 1 BLPOP k1 k2 5]
+     }
+ }
++
++start_server {tags {"audit-log"}} {
++    test {DEBUG AUDIT-ENTRY: basic JSON format for SET} {
++        set json [r debug audit-entry SET mykey myvalue]
++        # Verify it is valid JSON-like format with key fields
++        assert_match {*"command_name":"SET"*} $json
++        assert_match {*"command_type":"string"*} $json
++        assert_match {*"command_keys":\["mykey"\]*} $json
++        assert_match {*"db":0*} $json
++        assert_match {*"role":"master"*} $json
++        assert_match {*"extend":""*} $json
++    }
++
++    test {DEBUG AUDIT-ENTRY: includes all required fields} {
++        set json [r debug audit-entry HSET myhash field val]
++        assert_match {*"time":*} $json
++        assert_match {*"instance_id":*} $json
++        assert_match {*"proxy_addr":*} $json
++        assert_match {*"server_addr":*} $json
++        assert_match {*"role":*} $json
++        assert_match {*"client_addr":*} $json
++        assert_match {*"client_type":*} $json
++        assert_match {*"user":*} $json
++        assert_match {*"db":*} $json
++        assert_match {*"command_name":*} $json
++        assert_match {*"command_type":*} $json
++        assert_match {*"command_keys":*} $json
++        assert_match {*"command_param":*} $json
++        assert_match {*"use_time":*} $json
++        assert_match {*"extend":*} $json
++    }
++
++    test {DEBUG AUDIT-ENTRY: multi-key command keys array} {
++        set json [r debug audit-entry DEL k1 k2 k3]
++        assert_match {*"command_keys":\["k1","k2","k3"\]*} $json
++        assert_match {*"command_name":"DEL"*} $json
++        assert_match {*"command_type":"generic"*} $json
++    }
++
++    test {DEBUG AUDIT-ENTRY: JSON string escaping} {
++        set json [r debug audit-entry SET "key\"with\"quotes" "val\\backslash"]
++        assert_match {*"key\\\"with\\\"quotes"*} $json
++        assert_match {*"val\\\\backslash"*} $json
++    }
++
++    test {DEBUG AUDIT-ENTRY: encryption in command_param} {
++        r config set audit-log-encrypt-enabled yes
++        set json [r debug audit-entry SET mykey secret123]
++        # Key "mykey" should be plain, value "secret123" should be masked
++        assert_match {*"command_param":"SET mykey secr*****"*} $json
++        r config set audit-log-encrypt-enabled no
++    }
++
++    test {DEBUG AUDIT-ENTRY: client_type for normal client} {
++        set json [r debug audit-entry PING]
++        assert_match {*"client_type":"0"*} $json
++    }
++}
+-- 
+2.43.0
+

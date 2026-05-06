@@ -1,0 +1,131 @@
+From 7e3c1dcea12d81fce9822d27c51fa1cf31b8786b Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 19:11:43 +0800
+Subject: [PATCH 10/12] commit 9: Add transaction (MULTI/EXEC) audit support
+
+- Set server.audit_exec_time before EXEC loop for uniform timestamp
+- auditLogCommand skips during server.in_exec
+- Add auditLogTransactionCommand() called after each sub-command
+  in execCommand, checks error count to filter failed commands
+- Transaction entries set extend='isTrans' and use EXEC time
+- Fix enabled toggle: re-open file when re-enabled
+- DISCARD does not produce any audit logs
+- Failed sub-commands in transactions are excluded
+---
+ src/audit.c  | 26 +++++++++++++++++++++++---
+ src/audit.h  |  1 +
+ src/multi.c  |  5 +++++
+ src/server.h |  1 +
+ 4 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/src/audit.c b/src/audit.c
+index b2ff5fedd..f82218edc 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -246,9 +246,9 @@ int auditLogEnabledUpdate(int val, int prev, const char **err) {
+     UNUSED(prev);
+     UNUSED(err);
+     if (!val) {
+-        /* When disabled, close the file. The consumer thread will
+-         * still drain the queue but won't write to file. */
+         auditLogFileClose();
++    } else if (server.audit_log_path && server.audit_log_path[0] != '\0') {
++        auditLogFileOpen(server.audit_log_path);
+     }
+     return 1;
+ }
+@@ -1256,14 +1256,34 @@ static int auditResponseIsEmpty(client *c) {
+ 
+ /* Trigger audit logging for a command after execution. */
+ void auditLogCommand(client *c) {
++    /* Transactions are handled in execCommand */
++    if (server.in_exec) return;
++
+     if (!auditShouldLog(c)) return;
+     if (auditResponseIsError(c)) return;
+     if (auditResponseIsEmpty(c)) return;
+ 
+     auditLogEntry *entry = auditCreateEntry(c);
+     entry->use_time = (auditNanoTime() - c->audit_start_time) / 1000;
++    entry->raw = auditEntryToJSON(entry);
++
++    if (!auditLogQueuePush(entry)) {
++        auditFreeEntry(entry);
++    }
++}
++
++/* Audit a single command executed within a transaction (EXEC). */
++void auditLogTransactionCommand(client *c, long long prev_err_count) {
++    if (!auditShouldLog(c)) return;
++
++    /* Check if this sub-command produced an error */
++    if (server.stat_total_error_replies != prev_err_count) return;
+ 
+-    /* Serialize to JSON before pushing */
++    auditLogEntry *entry = auditCreateEntry(c);
++    entry->time = (long long)server.audit_exec_time * 1000000LL;
++    sdsfree(entry->extend);
++    entry->extend = sdsnew("isTrans");
++    entry->use_time = (auditNanoTime() - c->audit_start_time) / 1000;
+     entry->raw = auditEntryToJSON(entry);
+ 
+     if (!auditLogQueuePush(entry)) {
+diff --git a/src/audit.h b/src/audit.h
+index 8f109b8ff..08ee57503 100644
+--- a/src/audit.h
++++ b/src/audit.h
+@@ -78,6 +78,7 @@ void auditFreeEntry(auditLogEntry *entry);
+ void auditRebuildCustomerCommandDict(void);
+ int auditShouldLog(client *c);
+ void auditLogCommand(client *c);
++void auditLogTransactionCommand(client *c, long long prev_err_count);
+ long long auditNanoTime(void);
+ 
+ #endif /* __AUDIT_H */
+diff --git a/src/multi.c b/src/multi.c
+index ebbdabbf0..a5ca4c0e8 100644
+--- a/src/multi.c
++++ b/src/multi.c
+@@ -199,6 +199,7 @@ void execCommand(client *c) {
+     unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
+ 
+     server.in_exec = 1;
++    server.audit_exec_time = mstime();
+ 
+     orig_argv = c->argv;
+     orig_argc = c->argc;
+@@ -237,8 +238,11 @@ void execCommand(client *c) {
+                 "This command is no longer allowed for the "
+                 "following reason: %s", reason);
+         } else {
++            long long prev_err = server.stat_total_error_replies;
+             call(c,server.loading ? CMD_CALL_NONE : CMD_CALL_FULL);
+             serverAssert((c->flags & CLIENT_BLOCKED) == 0);
++
++            auditLogTransactionCommand(c, prev_err);
+         }
+ 
+         /* Commands may alter argc/argv, restore mstate. */
+@@ -274,6 +278,7 @@ void execCommand(client *c) {
+     }
+ 
+     server.in_exec = 0;
++    server.audit_exec_time = 0;
+ }
+ 
+ /* ===================== WATCH (CAS alike for MULTI/EXEC) ===================
+diff --git a/src/server.h b/src/server.h
+index bbef4e24b..b44e78951 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -1648,6 +1648,7 @@ struct redisServer {
+     char *audit_log_customer_command_list; /* Extra commands to audit */
+     long long audit_log_abort_count;      /* Audit log discard counter */
+     long long audit_log_record_count;     /* Audit log enqueue counter */
++    mstime_t audit_exec_time;             /* EXEC start time for transaction audit */
+ };
+ 
+ #define MAX_KEYS_BUFFER 256
+-- 
+2.43.0
+
