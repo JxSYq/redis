@@ -3394,6 +3394,7 @@ void InitServerLast() {
     initThreadedIO();
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
     server.initial_memory_usage = zmalloc_used_memory();
+    auditLogThreadStart();
 }
 
 /* Parse the flags string description 'strflags' and set them to the
@@ -4433,6 +4434,7 @@ int prepareForShutdown(int flags) {
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
+    auditLogThreadStop();
     serverLog(LL_WARNING,"%s is now ready to exit, bye bye...",
         server.sentinel_mode ? "Sentinel" : "Redis");
     return C_OK;
