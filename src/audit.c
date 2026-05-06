@@ -273,6 +273,424 @@ int auditLogQueueLengthUpdate(long long val, long long prev, const char **err) {
 }
 
 /* --------------------------------------------------------------------------
+ * Command type mapping
+ * -------------------------------------------------------------------------- */
+
+/* Forward declarations for case-insensitive SDS dict operations */
+uint64_t dictSdsCaseHash(const void *key);
+int dictSdsKeyCaseCompare(void *privdata, const void *key1, const void *key2);
+void dictSdsDestructor(void *privdata, void *val);
+
+static dict *audit_command_type_dict = NULL;
+
+static dictType commandTypeDictType = {
+    dictSdsCaseHash,            /* hash function (case-insensitive) */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCaseCompare,      /* key compare (case-insensitive) */
+    dictSdsDestructor,          /* key destructor (free SDS keys) */
+    NULL,                       /* val destructor (values are string literals) */
+    NULL                        /* allow to expand */
+};
+
+/* Helper macro to add a command type mapping */
+#define ADD_CMD_TYPE(cmd, type) \
+    dictAdd(audit_command_type_dict, sdsnew(cmd), (void *)(type))
+
+void auditCommandTypeInit(void) {
+    if (audit_command_type_dict != NULL) return;
+    audit_command_type_dict = dictCreate(&commandTypeDictType, NULL);
+
+    /* string */
+    ADD_CMD_TYPE("APPEND", "string");
+    ADD_CMD_TYPE("DECR", "string");
+    ADD_CMD_TYPE("DECRBY", "string");
+    ADD_CMD_TYPE("GET", "string");
+    ADD_CMD_TYPE("GETDEL", "string");
+    ADD_CMD_TYPE("GETEX", "string");
+    ADD_CMD_TYPE("GETRANGE", "string");
+    ADD_CMD_TYPE("GETSET", "string");
+    ADD_CMD_TYPE("INCR", "string");
+    ADD_CMD_TYPE("INCRBY", "string");
+    ADD_CMD_TYPE("INCRBYFLOAT", "string");
+    ADD_CMD_TYPE("MGET", "string");
+    ADD_CMD_TYPE("MSET", "string");
+    ADD_CMD_TYPE("MSETNX", "string");
+    ADD_CMD_TYPE("PSETEX", "string");
+    ADD_CMD_TYPE("SET", "string");
+    ADD_CMD_TYPE("SETEX", "string");
+    ADD_CMD_TYPE("SETNX", "string");
+    ADD_CMD_TYPE("SETRANGE", "string");
+    ADD_CMD_TYPE("STRALGO", "string");
+    ADD_CMD_TYPE("STRLEN", "string");
+    ADD_CMD_TYPE("SUBSTR", "string");
+
+    /* hash */
+    ADD_CMD_TYPE("HDEL", "hash");
+    ADD_CMD_TYPE("HEXISTS", "hash");
+    ADD_CMD_TYPE("HGET", "hash");
+    ADD_CMD_TYPE("HGETALL", "hash");
+    ADD_CMD_TYPE("HINCRBY", "hash");
+    ADD_CMD_TYPE("HINCRBYFLOAT", "hash");
+    ADD_CMD_TYPE("HKEYS", "hash");
+    ADD_CMD_TYPE("HLEN", "hash");
+    ADD_CMD_TYPE("HMGET", "hash");
+    ADD_CMD_TYPE("HMSET", "hash");
+    ADD_CMD_TYPE("HRANDFIELD", "hash");
+    ADD_CMD_TYPE("HSCAN", "hash");
+    ADD_CMD_TYPE("HSET", "hash");
+    ADD_CMD_TYPE("HSETNX", "hash");
+    ADD_CMD_TYPE("HSTRLEN", "hash");
+    ADD_CMD_TYPE("HVALS", "hash");
+
+    /* list */
+    ADD_CMD_TYPE("BLMOVE", "list");
+    ADD_CMD_TYPE("BLMPOP", "list");
+    ADD_CMD_TYPE("BLPOP", "list");
+    ADD_CMD_TYPE("BRPOP", "list");
+    ADD_CMD_TYPE("BRPOPLPUSH", "list");
+    ADD_CMD_TYPE("LINDEX", "list");
+    ADD_CMD_TYPE("LINSERT", "list");
+    ADD_CMD_TYPE("LLEN", "list");
+    ADD_CMD_TYPE("LMOVE", "list");
+    ADD_CMD_TYPE("LMPOP", "list");
+    ADD_CMD_TYPE("LPOP", "list");
+    ADD_CMD_TYPE("LPOS", "list");
+    ADD_CMD_TYPE("LPUSH", "list");
+    ADD_CMD_TYPE("LPUSHX", "list");
+    ADD_CMD_TYPE("LRANGE", "list");
+    ADD_CMD_TYPE("LREM", "list");
+    ADD_CMD_TYPE("LSET", "list");
+    ADD_CMD_TYPE("LTRIM", "list");
+    ADD_CMD_TYPE("RPOP", "list");
+    ADD_CMD_TYPE("RPOPLPUSH", "list");
+    ADD_CMD_TYPE("RPUSH", "list");
+    ADD_CMD_TYPE("RPUSHX", "list");
+
+    /* set */
+    ADD_CMD_TYPE("SADD", "set");
+    ADD_CMD_TYPE("SCARD", "set");
+    ADD_CMD_TYPE("SDIFF", "set");
+    ADD_CMD_TYPE("SDIFFSTORE", "set");
+    ADD_CMD_TYPE("SINTER", "set");
+    ADD_CMD_TYPE("SINTERCARD", "set");
+    ADD_CMD_TYPE("SINTERSTORE", "set");
+    ADD_CMD_TYPE("SISMEMBER", "set");
+    ADD_CMD_TYPE("SMEMBERS", "set");
+    ADD_CMD_TYPE("SMISMEMBER", "set");
+    ADD_CMD_TYPE("SMOVE", "set");
+    ADD_CMD_TYPE("SPOP", "set");
+    ADD_CMD_TYPE("SRANDMEMBER", "set");
+    ADD_CMD_TYPE("SREM", "set");
+    ADD_CMD_TYPE("SSCAN", "set");
+    ADD_CMD_TYPE("SUNION", "set");
+    ADD_CMD_TYPE("SUNIONSTORE", "set");
+
+    /* sorted-set */
+    ADD_CMD_TYPE("BZMPOP", "sorted-set");
+    ADD_CMD_TYPE("BZPOPMAX", "sorted-set");
+    ADD_CMD_TYPE("BZPOPMIN", "sorted-set");
+    ADD_CMD_TYPE("ZADD", "sorted-set");
+    ADD_CMD_TYPE("ZCARD", "sorted-set");
+    ADD_CMD_TYPE("ZCOUNT", "sorted-set");
+    ADD_CMD_TYPE("ZDIFF", "sorted-set");
+    ADD_CMD_TYPE("ZDIFFSTORE", "sorted-set");
+    ADD_CMD_TYPE("ZINCRBY", "sorted-set");
+    ADD_CMD_TYPE("ZINTER", "sorted-set");
+    ADD_CMD_TYPE("ZINTERCARD", "sorted-set");
+    ADD_CMD_TYPE("ZINTERSTORE", "sorted-set");
+    ADD_CMD_TYPE("ZLEXCOUNT", "sorted-set");
+    ADD_CMD_TYPE("ZMSCORE", "sorted-set");
+    ADD_CMD_TYPE("ZMPOP", "sorted-set");
+    ADD_CMD_TYPE("ZPOPMAX", "sorted-set");
+    ADD_CMD_TYPE("ZPOPMIN", "sorted-set");
+    ADD_CMD_TYPE("ZRANDMEMBER", "sorted-set");
+    ADD_CMD_TYPE("ZRANGE", "sorted-set");
+    ADD_CMD_TYPE("ZRANGEBYLEX", "sorted-set");
+    ADD_CMD_TYPE("ZRANGEBYSCORE", "sorted-set");
+    ADD_CMD_TYPE("ZRANGESTORE", "sorted-set");
+    ADD_CMD_TYPE("ZRANK", "sorted-set");
+    ADD_CMD_TYPE("ZREM", "sorted-set");
+    ADD_CMD_TYPE("ZREMRANGEBYLEX", "sorted-set");
+    ADD_CMD_TYPE("ZREMRANGEBYRANK", "sorted-set");
+    ADD_CMD_TYPE("ZREMRANGEBYSCORE", "sorted-set");
+    ADD_CMD_TYPE("ZREVRANGE", "sorted-set");
+    ADD_CMD_TYPE("ZREVRANGEBYLEX", "sorted-set");
+    ADD_CMD_TYPE("ZREVRANGEBYSCORE", "sorted-set");
+    ADD_CMD_TYPE("ZREVRANK", "sorted-set");
+    ADD_CMD_TYPE("ZSCAN", "sorted-set");
+    ADD_CMD_TYPE("ZSCORE", "sorted-set");
+    ADD_CMD_TYPE("ZUNION", "sorted-set");
+    ADD_CMD_TYPE("ZUNIONSTORE", "sorted-set");
+
+    /* bitmap */
+    ADD_CMD_TYPE("BITCOUNT", "bitmap");
+    ADD_CMD_TYPE("BITFIELD", "bitmap");
+    ADD_CMD_TYPE("BITFIELD_RO", "bitmap");
+    ADD_CMD_TYPE("BITOP", "bitmap");
+    ADD_CMD_TYPE("BITPOS", "bitmap");
+    ADD_CMD_TYPE("GETBIT", "bitmap");
+    ADD_CMD_TYPE("SETBIT", "bitmap");
+
+    /* hyperloglog */
+    ADD_CMD_TYPE("PFADD", "hyperloglog");
+    ADD_CMD_TYPE("PFCOUNT", "hyperloglog");
+    ADD_CMD_TYPE("PFDEBUG", "hyperloglog");
+    ADD_CMD_TYPE("PFMERGE", "hyperloglog");
+    ADD_CMD_TYPE("PFSELFTEST", "hyperloglog");
+
+    /* geo */
+    ADD_CMD_TYPE("GEOADD", "geo");
+    ADD_CMD_TYPE("GEODIST", "geo");
+    ADD_CMD_TYPE("GEOHASH", "geo");
+    ADD_CMD_TYPE("GEOPOS", "geo");
+    ADD_CMD_TYPE("GEORADIUS", "geo");
+    ADD_CMD_TYPE("GEORADIUSBYMEMBER", "geo");
+    ADD_CMD_TYPE("GEORADIUSBYMEMBER_RO", "geo");
+    ADD_CMD_TYPE("GEORADIUS_RO", "geo");
+    ADD_CMD_TYPE("GEOSEARCH", "geo");
+    ADD_CMD_TYPE("GEOSEARCHSTORE", "geo");
+
+    /* stream */
+    ADD_CMD_TYPE("XACK", "stream");
+    ADD_CMD_TYPE("XADD", "stream");
+    ADD_CMD_TYPE("XAUTOCLAIM", "stream");
+    ADD_CMD_TYPE("XCLAIM", "stream");
+    ADD_CMD_TYPE("XDEL", "stream");
+    ADD_CMD_TYPE("XGROUP", "stream");
+    ADD_CMD_TYPE("XINFO", "stream");
+    ADD_CMD_TYPE("XLEN", "stream");
+    ADD_CMD_TYPE("XPENDING", "stream");
+    ADD_CMD_TYPE("XRANGE", "stream");
+    ADD_CMD_TYPE("XREAD", "stream");
+    ADD_CMD_TYPE("XREADGROUP", "stream");
+    ADD_CMD_TYPE("XREVRANGE", "stream");
+    ADD_CMD_TYPE("XSETID", "stream");
+    ADD_CMD_TYPE("XTRIM", "stream");
+
+    /* pubsub */
+    ADD_CMD_TYPE("PSUBSCRIBE", "pubsub");
+    ADD_CMD_TYPE("PUBLISH", "pubsub");
+    ADD_CMD_TYPE("PUBSUB", "pubsub");
+    ADD_CMD_TYPE("PUNSUBSCRIBE", "pubsub");
+    ADD_CMD_TYPE("SPUBLISH", "pubsub");
+    ADD_CMD_TYPE("SSUBSCRIBE", "pubsub");
+    ADD_CMD_TYPE("SUBSCRIBE", "pubsub");
+    ADD_CMD_TYPE("SUNSUBSCRIBE", "pubsub");
+    ADD_CMD_TYPE("UNSUBSCRIBE", "pubsub");
+
+    /* scripting */
+    ADD_CMD_TYPE("EVAL", "scripting");
+    ADD_CMD_TYPE("EVAL_RO", "scripting");
+    ADD_CMD_TYPE("EVALSHA", "scripting");
+    ADD_CMD_TYPE("EVALSHA_RO", "scripting");
+    ADD_CMD_TYPE("FUNCTION", "scripting");
+    ADD_CMD_TYPE("SCRIPT", "scripting");
+
+    /* transactions */
+    ADD_CMD_TYPE("DISCARD", "transactions");
+    ADD_CMD_TYPE("EXEC", "transactions");
+    ADD_CMD_TYPE("MULTI", "transactions");
+    ADD_CMD_TYPE("UNWATCH", "transactions");
+    ADD_CMD_TYPE("WATCH", "transactions");
+
+    /* connection */
+    ADD_CMD_TYPE("AUTH", "connection");
+    ADD_CMD_TYPE("CLIENT", "connection");
+    ADD_CMD_TYPE("ECHO", "connection");
+    ADD_CMD_TYPE("HELLO", "connection");
+    ADD_CMD_TYPE("PING", "connection");
+    ADD_CMD_TYPE("QUIT", "connection");
+    ADD_CMD_TYPE("RESET", "connection");
+    ADD_CMD_TYPE("SELECT", "connection");
+
+    /* server */
+    ADD_CMD_TYPE("ACL", "server");
+    ADD_CMD_TYPE("BGREWRITEAOF", "server");
+    ADD_CMD_TYPE("BGSAVE", "server");
+    ADD_CMD_TYPE("COMMAND", "server");
+    ADD_CMD_TYPE("CONFIG", "server");
+    ADD_CMD_TYPE("DBSIZE", "server");
+    ADD_CMD_TYPE("DEBUG", "server");
+    ADD_CMD_TYPE("FAILOVER", "server");
+    ADD_CMD_TYPE("FLUSHALL", "server");
+    ADD_CMD_TYPE("FLUSHDB", "server");
+    ADD_CMD_TYPE("INFO", "server");
+    ADD_CMD_TYPE("LASTSAVE", "server");
+    ADD_CMD_TYPE("LATENCY", "server");
+    ADD_CMD_TYPE("LOLWUT", "server");
+    ADD_CMD_TYPE("MEMORY", "server");
+    ADD_CMD_TYPE("MODULE", "server");
+    ADD_CMD_TYPE("MONITOR", "server");
+    ADD_CMD_TYPE("PSYNC", "server");
+    ADD_CMD_TYPE("REPLCONF", "server");
+    ADD_CMD_TYPE("REPLICAOF", "server");
+    ADD_CMD_TYPE("ROLE", "server");
+    ADD_CMD_TYPE("SAVE", "server");
+    ADD_CMD_TYPE("SHUTDOWN", "server");
+    ADD_CMD_TYPE("SLAVEOF", "server");
+    ADD_CMD_TYPE("SLOWLOG", "server");
+    ADD_CMD_TYPE("SWAPDB", "server");
+    ADD_CMD_TYPE("SYNC", "server");
+    ADD_CMD_TYPE("TIME", "server");
+
+    /* generic */
+    ADD_CMD_TYPE("COPY", "generic");
+    ADD_CMD_TYPE("DEL", "generic");
+    ADD_CMD_TYPE("DUMP", "generic");
+    ADD_CMD_TYPE("EXISTS", "generic");
+    ADD_CMD_TYPE("EXPIRE", "generic");
+    ADD_CMD_TYPE("EXPIREAT", "generic");
+    ADD_CMD_TYPE("EXPIRETIME", "generic");
+    ADD_CMD_TYPE("KEYS", "generic");
+    ADD_CMD_TYPE("MIGRATE", "generic");
+    ADD_CMD_TYPE("MOVE", "generic");
+    ADD_CMD_TYPE("OBJECT", "generic");
+    ADD_CMD_TYPE("PERSIST", "generic");
+    ADD_CMD_TYPE("PEXPIRE", "generic");
+    ADD_CMD_TYPE("PEXPIREAT", "generic");
+    ADD_CMD_TYPE("PEXPIRETIME", "generic");
+    ADD_CMD_TYPE("PTTL", "generic");
+    ADD_CMD_TYPE("RANDOMKEY", "generic");
+    ADD_CMD_TYPE("RENAME", "generic");
+    ADD_CMD_TYPE("RENAMENX", "generic");
+    ADD_CMD_TYPE("RESTORE", "generic");
+    ADD_CMD_TYPE("SCAN", "generic");
+    ADD_CMD_TYPE("SORT", "generic");
+    ADD_CMD_TYPE("SORT_RO", "generic");
+    ADD_CMD_TYPE("TOUCH", "generic");
+    ADD_CMD_TYPE("TTL", "generic");
+    ADD_CMD_TYPE("TYPE", "generic");
+    ADD_CMD_TYPE("UNLINK", "generic");
+    ADD_CMD_TYPE("WAIT", "generic");
+    ADD_CMD_TYPE("WAITREPLICAS", "generic");
+
+    /* cluster */
+    ADD_CMD_TYPE("ASKING", "cluster");
+    ADD_CMD_TYPE("CLUSTER", "cluster");
+    ADD_CMD_TYPE("READONLY", "cluster");
+    ADD_CMD_TYPE("READWRITE", "cluster");
+    ADD_CMD_TYPE("REPLICATE", "cluster");
+
+    /* bf (Bloom Filter) */
+    ADD_CMD_TYPE("BF.ADD", "bf");
+    ADD_CMD_TYPE("BF.CARD", "bf");
+    ADD_CMD_TYPE("BF.EXISTS", "bf");
+    ADD_CMD_TYPE("BF.INFO", "bf");
+    ADD_CMD_TYPE("BF.INSERT", "bf");
+    ADD_CMD_TYPE("BF.LOADCHUNK", "bf");
+    ADD_CMD_TYPE("BF.MADD", "bf");
+    ADD_CMD_TYPE("BF.MEXISTS", "bf");
+    ADD_CMD_TYPE("BF.RESERVE", "bf");
+    ADD_CMD_TYPE("BF.SCANDUMP", "bf");
+
+    /* cf (Cuckoo Filter) */
+    ADD_CMD_TYPE("CF.ADD", "cf");
+    ADD_CMD_TYPE("CF.ADDNX", "cf");
+    ADD_CMD_TYPE("CF.COUNT", "cf");
+    ADD_CMD_TYPE("CF.DEL", "cf");
+    ADD_CMD_TYPE("CF.EXISTS", "cf");
+    ADD_CMD_TYPE("CF.INFO", "cf");
+    ADD_CMD_TYPE("CF.INSERT", "cf");
+    ADD_CMD_TYPE("CF.INSERTNX", "cf");
+    ADD_CMD_TYPE("CF.LOADCHUNK", "cf");
+    ADD_CMD_TYPE("CF.MEXISTS", "cf");
+    ADD_CMD_TYPE("CF.RESERVE", "cf");
+    ADD_CMD_TYPE("CF.SCANDUMP", "cf");
+
+    /* json */
+    ADD_CMD_TYPE("JSON.ARRAPPEND", "json");
+    ADD_CMD_TYPE("JSON.ARRINDEX", "json");
+    ADD_CMD_TYPE("JSON.ARRINSERT", "json");
+    ADD_CMD_TYPE("JSON.ARRLEN", "json");
+    ADD_CMD_TYPE("JSON.ARRPOP", "json");
+    ADD_CMD_TYPE("JSON.ARRTRIM", "json");
+    ADD_CMD_TYPE("JSON.CLEAR", "json");
+    ADD_CMD_TYPE("JSON.DEBUG", "json");
+    ADD_CMD_TYPE("JSON.DEL", "json");
+    ADD_CMD_TYPE("JSON.FORGET", "json");
+    ADD_CMD_TYPE("JSON.GET", "json");
+    ADD_CMD_TYPE("JSON.MGET", "json");
+    ADD_CMD_TYPE("JSON.NUMINCRBY", "json");
+    ADD_CMD_TYPE("JSON.NUMMULTBY", "json");
+    ADD_CMD_TYPE("JSON.OBJKEYS", "json");
+    ADD_CMD_TYPE("JSON.OBJLEN", "json");
+    ADD_CMD_TYPE("JSON.RESP", "json");
+    ADD_CMD_TYPE("JSON.SET", "json");
+    ADD_CMD_TYPE("JSON.STRAPPEND", "json");
+    ADD_CMD_TYPE("JSON.STRLEN", "json");
+    ADD_CMD_TYPE("JSON.TOGGLE", "json");
+    ADD_CMD_TYPE("JSON.TYPE", "json");
+
+    /* search */
+    ADD_CMD_TYPE("FT.AGGREGATE", "search");
+    ADD_CMD_TYPE("FT.ALIASADD", "search");
+    ADD_CMD_TYPE("FT.ALIASDEL", "search");
+    ADD_CMD_TYPE("FT.ALIASUPDATE", "search");
+    ADD_CMD_TYPE("FT.ALTER", "search");
+    ADD_CMD_TYPE("FT.CONFIG", "search");
+    ADD_CMD_TYPE("FT.CREATE", "search");
+    ADD_CMD_TYPE("FT.CURSOR", "search");
+    ADD_CMD_TYPE("FT.DICTADD", "search");
+    ADD_CMD_TYPE("FT.DICTDEL", "search");
+    ADD_CMD_TYPE("FT.DICTDUMP", "search");
+    ADD_CMD_TYPE("FT.DROPINDEX", "search");
+    ADD_CMD_TYPE("FT.EXPLAIN", "search");
+    ADD_CMD_TYPE("FT.EXPLAINCLI", "search");
+    ADD_CMD_TYPE("FT.INFO", "search");
+    ADD_CMD_TYPE("FT.PROFILE", "search");
+    ADD_CMD_TYPE("FT.SEARCH", "search");
+    ADD_CMD_TYPE("FT.SPELLCHECK", "search");
+    ADD_CMD_TYPE("FT.SUGADD", "search");
+    ADD_CMD_TYPE("FT.SUGDEL", "search");
+    ADD_CMD_TYPE("FT.SUGGET", "search");
+    ADD_CMD_TYPE("FT.SUGLEN", "search");
+    ADD_CMD_TYPE("FT.SYNDUMP", "search");
+    ADD_CMD_TYPE("FT.SYNUPDATE", "search");
+    ADD_CMD_TYPE("FT.TAGVALS", "search");
+
+    /* timeseries */
+    ADD_CMD_TYPE("TS.ADD", "timeseries");
+    ADD_CMD_TYPE("TS.ALTER", "timeseries");
+    ADD_CMD_TYPE("TS.CREATE", "timeseries");
+    ADD_CMD_TYPE("TS.CREATERULE", "timeseries");
+    ADD_CMD_TYPE("TS.DECRBY", "timeseries");
+    ADD_CMD_TYPE("TS.DEL", "timeseries");
+    ADD_CMD_TYPE("TS.DELETERULE", "timeseries");
+    ADD_CMD_TYPE("TS.GET", "timeseries");
+    ADD_CMD_TYPE("TS.INCRBY", "timeseries");
+    ADD_CMD_TYPE("TS.INFO", "timeseries");
+    ADD_CMD_TYPE("TS.MADD", "timeseries");
+    ADD_CMD_TYPE("TS.MGET", "timeseries");
+    ADD_CMD_TYPE("TS.MRANGE", "timeseries");
+    ADD_CMD_TYPE("TS.MREVRANGE", "timeseries");
+    ADD_CMD_TYPE("TS.QUERYINDEX", "timeseries");
+    ADD_CMD_TYPE("TS.RANGE", "timeseries");
+    ADD_CMD_TYPE("TS.REVRANGE", "timeseries");
+
+    /* topk */
+    ADD_CMD_TYPE("TOPK.ADD", "topk");
+    ADD_CMD_TYPE("TOPK.COUNT", "topk");
+    ADD_CMD_TYPE("TOPK.INCRBY", "topk");
+    ADD_CMD_TYPE("TOPK.INFO", "topk");
+    ADD_CMD_TYPE("TOPK.LIST", "topk");
+    ADD_CMD_TYPE("TOPK.QUERY", "topk");
+    ADD_CMD_TYPE("TOPK.RESERVE", "topk");
+}
+
+const char *auditGetCommandType(const char *cmdName) {
+    if (cmdName == NULL || cmdName[0] == '\0') return "undefined";
+    if (audit_command_type_dict == NULL) return "undefined";
+
+    sds key = sdsnew(cmdName);
+    dictEntry *de = dictFind(audit_command_type_dict, key);
+    sdsfree(key);
+
+    if (de) return (const char *)dictGetVal(de);
+    return "undefined";
+}
+
+/* --------------------------------------------------------------------------
  * Consumer thread
  * -------------------------------------------------------------------------- */
 
