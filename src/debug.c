@@ -904,6 +904,23 @@ NULL
     {
         const char *type = auditGetCommandType(c->argv[2]->ptr);
         addReplyBulkCString(c, type);
+    } else if (!strcasecmp(c->argv[1]->ptr,"audit-keys") &&
+               c->argc >= 3)
+    {
+        /* Temporarily override client argv for auditExtractKeys */
+        robj **orig_argv = c->argv;
+        int orig_argc = c->argc;
+        c->argv = c->argv + 2;
+        c->argc = c->argc - 2;
+        int numkeys = 0;
+        sds *keys = auditExtractKeys(c, &numkeys);
+        c->argv = orig_argv;
+        c->argc = orig_argc;
+        addReplyArrayLen(c, numkeys);
+        for (int i = 0; i < numkeys; i++) {
+            addReplyBulkSds(c, keys[i]);
+        }
+        zfree(keys); /* keys sds were moved to reply, just free array */
     } else {
         addReplySubcommandSyntaxError(c);
         return;
