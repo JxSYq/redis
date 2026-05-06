@@ -1,0 +1,409 @@
+From 5a15ff6962f4388b99b9d4a18c07945bd1c9699a Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 17:37:01 +0800
+Subject: [PATCH 06/12] commit 5: Add CommandKeys extraction logic
+
+- Implement auditExtractKeys() to extract key names from command args
+- Handle special commands per audit design:
+  MSET/MSETNX: odd positions are keys
+  SMOVE/ZRANGESTORE/BLMOVE/LMOVE: first two args
+  ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE: destkey + numkeys
+  ZDIFF/ZUNION/ZINTER: numkeys-based
+  BITOP: from 2nd arg
+  SORT/SORT_RO: first arg
+  BLPOP/BRPOP: all but last (timeout)
+  BRPOPLPUSH: first two
+  XREAD/XREADGROUP: STREAMS keyword parsing
+- Default rules: multi-key (DEL/EXISTS/UNLINK/TOUCH/MGET)
+  vs single-key (first arg)
+- Add auditFreeKeys() to free extracted key arrays
+- Add DEBUG AUDIT-KEYS command and comprehensive Tcl tests
+---
+ src/audit.c              | 199 +++++++++++++++++++++++++++++++++++++++
+ src/audit.h              |   4 +
+ src/debug.c              |  17 ++++
+ tests/unit/audit-log.tcl | 120 +++++++++++++++++++++++
+ 4 files changed, 340 insertions(+)
+
+diff --git a/src/audit.c b/src/audit.c
+index f2343e157..50fa64b02 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -690,6 +690,205 @@ const char *auditGetCommandType(const char *cmdName) {
+     return "undefined";
+ }
+ 
++/* --------------------------------------------------------------------------
++ * Command keys extraction
++ * -------------------------------------------------------------------------- */
++
++/* Number of keys that will be tracked. */
++#define AUDIT_MAX_KEYS 256
++
++/* Is the command a "multi-key" command where all arguments are keys?
++ * Based on the audit design: DEL, EXISTS, UNLINK, TOUCH, MGET, WAIT */
++static int auditIsAllKeysCommand(const char *cmdname) {
++    return !strcasecmp(cmdname, "del") ||
++           !strcasecmp(cmdname, "exists") ||
++           !strcasecmp(cmdname, "unlink") ||
++           !strcasecmp(cmdname, "touch") ||
++           !strcasecmp(cmdname, "mget");
++}
++
++/* Extract keys from command arguments based on audit-specific rules.
++ * Returns an array of SDS key strings and sets *numkeys.
++ * The caller is responsible for freeing each key and the array. */
++sds *auditExtractKeys(client *c, int *numkeys) {
++    sds *keys = NULL;
++    *numkeys = 0;
++
++    if (c->argc <= 1) return NULL;
++
++    const char *cmdname = (const char *)c->argv[0]->ptr;
++    robj **argv = c->argv;
++    int argc = c->argc;
++
++    /* --- Special commands per audit design --- */
++
++    /* MSET/MSETNX: odd positions (1,3,5...) are keys */
++    if (!strcasecmp(cmdname, "mset") || !strcasecmp(cmdname, "msetnx")) {
++        *numkeys = (argc - 1) / 2;
++        if (*numkeys == 0) return NULL;
++        keys = zmalloc(sizeof(sds) * (*numkeys));
++        for (int i = 1, ki = 0; i < argc; i += 2, ki++) {
++            keys[ki] = sdsnew(argv[i]->ptr);
++        }
++        return keys;
++    }
++
++    /* SMOVE, ZRANGESTORE, BLMOVE, LMOVE: first two args are keys */
++    if (!strcasecmp(cmdname, "smove") ||
++        !strcasecmp(cmdname, "zrangestore") ||
++        !strcasecmp(cmdname, "blmove") ||
++        !strcasecmp(cmdname, "lmove")) {
++        if (argc < 3) return NULL;
++        *numkeys = 2;
++        keys = zmalloc(sizeof(sds) * 2);
++        keys[0] = sdsnew(argv[1]->ptr);
++        keys[1] = sdsnew(argv[2]->ptr);
++        return keys;
++    }
++
++    /* ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE: destkey + numkeys-based keys
++     * Format: CMD destkey numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] */
++    if (!strcasecmp(cmdname, "zunionstore") ||
++        !strcasecmp(cmdname, "zinterstore") ||
++        !strcasecmp(cmdname, "zdiffstore")) {
++        if (argc < 4) return NULL;
++        long nkeys;
++        if (!string2l(argv[2]->ptr, sdslen(argv[2]->ptr), &nkeys))
++            return NULL;
++        if (nkeys <= 0 || nkeys > (argc - 3)) return NULL;
++        *numkeys = (int)nkeys + 1; /* +1 for destkey */
++        keys = zmalloc(sizeof(sds) * (*numkeys));
++        keys[0] = sdsnew(argv[1]->ptr); /* destkey */
++        for (int i = 0; i < (int)nkeys; i++) {
++            keys[i + 1] = sdsnew(argv[3 + i]->ptr);
++        }
++        return keys;
++    }
++
++    /* ZDIFF/ZUNION/ZINTER: numkeys-based keys
++     * Format: CMD numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...]
++     * Note: ZDIFF/ZUNION/ZINTER have no destkey */
++    if (!strcasecmp(cmdname, "zdiff") ||
++        !strcasecmp(cmdname, "zunion") ||
++        !strcasecmp(cmdname, "zinter")) {
++        if (argc < 3) return NULL;
++        long nkeys;
++        if (!string2l(argv[1]->ptr, sdslen(argv[1]->ptr), &nkeys))
++            return NULL;
++        if (nkeys <= 0 || nkeys > (argc - 2)) return NULL;
++        *numkeys = (int)nkeys;
++        keys = zmalloc(sizeof(sds) * (*numkeys));
++        for (int i = 0; i < (int)nkeys; i++) {
++            keys[i] = sdsnew(argv[2 + i]->ptr);
++        }
++        return keys;
++    }
++
++    /* BITOP: operation is arg[1], keys start from arg[2] */
++    if (!strcasecmp(cmdname, "bitop")) {
++        if (argc < 4) return NULL;
++        *numkeys = argc - 2;
++        keys = zmalloc(sizeof(sds) * (*numkeys));
++        for (int i = 2, ki = 0; i < argc; i++, ki++) {
++            keys[ki] = sdsnew(argv[i]->ptr);
++        }
++        return keys;
++    }
++
++    /* SORT: first arg is key */
++    if (!strcasecmp(cmdname, "sort")) {
++        *numkeys = 1;
++        keys = zmalloc(sizeof(sds));
++        keys[0] = sdsnew(argv[1]->ptr);
++        return keys;
++    }
++
++    /* SORT_RO: first arg is key (same as SORT) */
++    if (!strcasecmp(cmdname, "sort_ro")) {
++        *numkeys = 1;
++        keys = zmalloc(sizeof(sds));
++        keys[0] = sdsnew(argv[1]->ptr);
++        return keys;
++    }
++
++    /* BLPOP/BRPOP: all args except the last one (timeout) are keys */
++    if (!strcasecmp(cmdname, "blpop") || !strcasecmp(cmdname, "brpop")) {
++        *numkeys = argc - 2; /* minus cmd name and timeout */
++        if (*numkeys <= 0) return NULL;
++        keys = zmalloc(sizeof(sds) * (*numkeys));
++        for (int i = 1, ki = 0; i < argc - 1; i++, ki++) {
++            keys[ki] = sdsnew(argv[i]->ptr);
++        }
++        return keys;
++    }
++
++    /* BRPOPLPUSH: first two args are keys */
++    if (!strcasecmp(cmdname, "brpoplpush")) {
++        if (argc < 3) return NULL;
++        *numkeys = 2;
++        keys = zmalloc(sizeof(sds) * 2);
++        keys[0] = sdsnew(argv[1]->ptr);
++        keys[1] = sdsnew(argv[2]->ptr);
++        return keys;
++    }
++
++    /* XREAD/XREADGROUP: keys after STREAMS keyword
++     * Format: XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
++     * Format: XREADGROUP GROUP group consumer [...] STREAMS key [key ...] id [id ...] */
++    if (!strcasecmp(cmdname, "xread") || !strcasecmp(cmdname, "xreadgroup")) {
++        /* Find STREAMS keyword position */
++        int streams_pos = -1;
++        for (int i = 1; i < argc; i++) {
++            if (!strcasecmp(argv[i]->ptr, "streams")) {
++                streams_pos = i;
++                break;
++            }
++        }
++        if (streams_pos < 0 || streams_pos + 1 >= argc) return NULL;
++
++        /* Keys are between STREAMS and IDs.
++         * IDs start at position: (argc + streams_pos + 1) / 2
++         * Actually: keys = argv[streams_pos+1 .. (streams_pos + 1 + (argc - streams_pos - 1) / 2) - 1]
++         * The IDs are the second half of arguments after STREAMS */
++        int remaining = argc - streams_pos - 1;
++        *numkeys = remaining / 2;
++        if (*numkeys <= 0) return NULL;
++        keys = zmalloc(sizeof(sds) * (*numkeys));
++        for (int i = 0; i < *numkeys; i++) {
++            keys[i] = sdsnew(argv[streams_pos + 1 + i]->ptr);
++        }
++        return keys;
++    }
++
++    /* --- Default rules --- */
++
++    /* Multi-key commands: all args are keys */
++    if (auditIsAllKeysCommand(cmdname)) {
++        if (argc < 2) return NULL;
++        *numkeys = argc - 1;
++        keys = zmalloc(sizeof(sds) * (*numkeys));
++        for (int i = 1; i < argc; i++) {
++            keys[i - 1] = sdsnew(argv[i]->ptr);
++        }
++        return keys;
++    }
++
++    /* Default: single key command, first argument is the key */
++    *numkeys = 1;
++    keys = zmalloc(sizeof(sds));
++    keys[0] = sdsnew(argv[1]->ptr);
++    return keys;
++}
++
++/* Free keys array returned by auditExtractKeys */
++void auditFreeKeys(sds *keys, int numkeys) {
++    if (keys == NULL) return;
++    for (int i = 0; i < numkeys; i++) {
++        sdsfree(keys[i]);
++    }
++    zfree(keys);
++}
++
+ /* --------------------------------------------------------------------------
+  * Consumer thread
+  * -------------------------------------------------------------------------- */
+diff --git a/src/audit.h b/src/audit.h
+index d1f160505..f331f5ff8 100644
+--- a/src/audit.h
++++ b/src/audit.h
+@@ -38,4 +38,8 @@ int auditLogQueueLengthUpdate(long long val, long long prev, const char **err);
+ void auditCommandTypeInit(void);
+ const char *auditGetCommandType(const char *cmdName);
+ 
++/* Command keys extraction */
++sds *auditExtractKeys(client *c, int *numkeys);
++void auditFreeKeys(sds *keys, int numkeys);
++
+ #endif /* __AUDIT_H */
+diff --git a/src/debug.c b/src/debug.c
+index 940e18b55..9904541e6 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -904,6 +904,23 @@ NULL
+     {
+         const char *type = auditGetCommandType(c->argv[2]->ptr);
+         addReplyBulkCString(c, type);
++    } else if (!strcasecmp(c->argv[1]->ptr,"audit-keys") &&
++               c->argc >= 3)
++    {
++        /* Temporarily override client argv for auditExtractKeys */
++        robj **orig_argv = c->argv;
++        int orig_argc = c->argc;
++        c->argv = c->argv + 2;
++        c->argc = c->argc - 2;
++        int numkeys = 0;
++        sds *keys = auditExtractKeys(c, &numkeys);
++        c->argv = orig_argv;
++        c->argc = orig_argc;
++        addReplyArrayLen(c, numkeys);
++        for (int i = 0; i < numkeys; i++) {
++            addReplyBulkSds(c, keys[i]);
++        }
++        zfree(keys); /* keys sds were moved to reply, just free array */
+     } else {
+         addReplySubcommandSyntaxError(c);
+         return;
+diff --git a/tests/unit/audit-log.tcl b/tests/unit/audit-log.tcl
+index 2042d99f4..d0291c4b0 100644
+--- a/tests/unit/audit-log.tcl
++++ b/tests/unit/audit-log.tcl
+@@ -169,3 +169,123 @@ start_server {tags {"audit-log"}} {
+         assert_equal "undefined" [r debug audit-type NOTACMD]
+     }
+ }
++
++start_server {tags {"audit-log"}} {
++    test {DEBUG AUDIT-KEYS: single key command (SET)} {
++        set keys [r debug audit-keys SET mykey myvalue]
++        assert_equal 1 [llength $keys]
++        assert_equal "mykey" [lindex $keys 0]
++    }
++
++    test {DEBUG AUDIT-KEYS: multi-key command (DEL)} {
++        set keys [r debug audit-keys DEL k1 k2 k3]
++        assert_equal 3 [llength $keys]
++        assert_equal "k1" [lindex $keys 0]
++        assert_equal "k2" [lindex $keys 1]
++        assert_equal "k3" [lindex $keys 2]
++    }
++
++    test {DEBUG AUDIT-KEYS: MSET odd positions} {
++        set keys [r debug audit-keys MSET k1 v1 k2 v2 k3 v3]
++        assert_equal 3 [llength $keys]
++        assert_equal "k1" [lindex $keys 0]
++        assert_equal "k2" [lindex $keys 1]
++        assert_equal "k3" [lindex $keys 2]
++    }
++
++    test {DEBUG AUDIT-KEYS: SMOVE first two args} {
++        set keys [r debug audit-keys SMOVE src dst member]
++        assert_equal 2 [llength $keys]
++        assert_equal "src" [lindex $keys 0]
++        assert_equal "dst" [lindex $keys 1]
++    }
++
++    test {DEBUG AUDIT-KEYS: BLPOP all but last} {
++        set keys [r debug audit-keys BLPOP k1 k2 5]
++        assert_equal 2 [llength $keys]
++        assert_equal "k1" [lindex $keys 0]
++        assert_equal "k2" [lindex $keys 1]
++    }
++
++    test {DEBUG AUDIT-KEYS: BRPOPLPUSH first two} {
++        set keys [r debug audit-keys BRPOPLPUSH src dst timeout]
++        assert_equal 2 [llength $keys]
++        assert_equal "src" [lindex $keys 0]
++        assert_equal "dst" [lindex $keys 1]
++    }
++
++    test {DEBUG AUDIT-KEYS: ZUNIONSTORE destkey + numkeys} {
++        set keys [r debug audit-keys ZUNIONSTORE dest 3 k1 k2 k3]
++        assert_equal 4 [llength $keys]
++        assert_equal "dest" [lindex $keys 0]
++        assert_equal "k1" [lindex $keys 1]
++        assert_equal "k2" [lindex $keys 2]
++        assert_equal "k3" [lindex $keys 3]
++    }
++
++    test {DEBUG AUDIT-KEYS: ZUNION numkeys-based} {
++        set keys [r debug audit-keys ZUNION 2 k1 k2]
++        assert_equal 2 [llength $keys]
++        assert_equal "k1" [lindex $keys 0]
++        assert_equal "k2" [lindex $keys 1]
++    }
++
++    test {DEBUG AUDIT-KEYS: BITOP from 2nd arg} {
++        set keys [r debug audit-keys BITOP AND dest k1 k2 k3]
++        assert_equal 4 [llength $keys]
++        assert_equal "dest" [lindex $keys 0]
++        assert_equal "k1" [lindex $keys 1]
++        assert_equal "k2" [lindex $keys 2]
++        assert_equal "k3" [lindex $keys 3]
++    }
++
++    test {DEBUG AUDIT-KEYS: SORT first arg} {
++        set keys [r debug audit-keys SORT mykey LIMIT 0 10 STORE dest]
++        assert_equal 1 [llength $keys]
++        assert_equal "mykey" [lindex $keys 0]
++    }
++
++    test {DEBUG AUDIT-KEYS: XREAD STREAMS keys} {
++        set keys [r debug audit-keys XREAD COUNT 2 STREAMS s1 s2 0 0]
++        assert_equal 2 [llength $keys]
++        assert_equal "s1" [lindex $keys 0]
++        assert_equal "s2" [lindex $keys 1]
++    }
++
++    test {DEBUG AUDIT-KEYS: XREADGROUP STREAMS keys} {
++        set keys [r debug audit-keys XREADGROUP GROUP g c STREAMS s1 s2 s3 0 0 0]
++        assert_equal 3 [llength $keys]
++        assert_equal "s1" [lindex $keys 0]
++        assert_equal "s2" [lindex $keys 1]
++        assert_equal "s3" [lindex $keys 2]
++    }
++
++    test {DEBUG AUDIT-KEYS: EXISTS all args are keys} {
++        set keys [r debug audit-keys EXISTS k1 k2]
++        assert_equal 2 [llength $keys]
++        assert_equal "k1" [lindex $keys 0]
++        assert_equal "k2" [lindex $keys 1]
++    }
++
++    test {DEBUG AUDIT-KEYS: UNLINK all args are keys} {
++        set keys [r debug audit-keys UNLINK k1 k2]
++        assert_equal 2 [llength $keys]
++        assert_equal "k1" [lindex $keys 0]
++        assert_equal "k2" [lindex $keys 1]
++    }
++
++    test {DEBUG AUDIT-KEYS: TOUCH all args are keys} {
++        set keys [r debug audit-keys TOUCH k1 k2]
++        assert_equal 2 [llength $keys]
++        assert_equal "k1" [lindex $keys 0]
++        assert_equal "k2" [lindex $keys 1]
++    }
++
++    test {DEBUG AUDIT-KEYS: MGET all args are keys} {
++        set keys [r debug audit-keys MGET k1 k2 k3]
++        assert_equal 3 [llength $keys]
++        assert_equal "k1" [lindex $keys 0]
++        assert_equal "k2" [lindex $keys 1]
++        assert_equal "k3" [lindex $keys 2]
++    }
++}
+-- 
+2.43.0
+

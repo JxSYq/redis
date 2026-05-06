@@ -1,0 +1,45 @@
+From 3050e01a1321eb9ae4493998b911b1c561ce7094 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 19:12:56 +0800
+Subject: [PATCH 11/12] commit 10: Add INFO audit_log statistics section
+
+- Add 'audit_log' section to genRedisInfoString()
+- Expose: audit_log_enabled, audit_log_record_count,
+  audit_log_abort_count, audit_log_queue_length
+- Supports INFO all and INFO audit_log
+---
+ src/server.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/server.c b/src/server.c
+index ada50f763..71b1ca95d 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -5396,6 +5396,24 @@ sds genRedisInfoString(const char *section) {
+         }
+     }
+ 
++    /* Audit log */
++    if (allsections || defsections || !strcasecmp(section,"audit_log")) {
++        if (sections++) info = sdscat(info,"\r\n");
++        info = sdscatprintf(info, "# Audit_log\r\n");
++        info = sdscatprintf(info,
++            "audit_log_enabled:%s\r\n",
++            server.audit_log_enabled ? "yes" : "no");
++        info = sdscatprintf(info,
++            "audit_log_record_count:%lld\r\n",
++            server.audit_log_record_count);
++        info = sdscatprintf(info,
++            "audit_log_abort_count:%lld\r\n",
++            server.audit_log_abort_count);
++        info = sdscatprintf(info,
++            "audit_log_queue_length:%d\r\n",
++            auditLogQueueLen());
++    }
++
+     /* Get info from modules.
+      * if user asked for "everything" or "modules", or a specific section
+      * that's not found yet. */
+-- 
+2.43.0
+

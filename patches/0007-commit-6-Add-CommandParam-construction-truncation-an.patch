@@ -1,0 +1,243 @@
+From d4c817c24beb7309f64b8cb6885eff26170b4f9b Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 17:50:48 +0800
+Subject: [PATCH 07/12] commit 6: Add CommandParam construction, truncation and
+ encryption
+
+- Implement auditBuildCommandParam() to build space-separated
+  command param string from argv
+- Per-param max length = 1024 / (argc - 1), command name excluded
+- Truncation: when param exceeds max, append '...(N more bytes)'
+- Encryption (audit-log-encrypt-enabled): keys are never masked,
+  values get first-half plaintext + second-half asterisks
+- Positional key matching using auditExtractKeys output
+- Add DEBUG AUDIT-PARAM <encrypt> command for testing
+- Add comprehensive Tcl tests for all scenarios
+---
+ src/audit.c              | 96 ++++++++++++++++++++++++++++++++++++++++
+ src/audit.h              |  3 ++
+ src/debug.c              | 16 +++++++
+ tests/unit/audit-log.tcl | 64 +++++++++++++++++++++++++++
+ 4 files changed, 179 insertions(+)
+
+diff --git a/src/audit.c b/src/audit.c
+index 50fa64b02..b16d0b388 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -889,6 +889,102 @@ void auditFreeKeys(sds *keys, int numkeys) {
+     zfree(keys);
+ }
+ 
++/* --------------------------------------------------------------------------
++ * CommandParam construction, truncation and encryption
++ * -------------------------------------------------------------------------- */
++
++#define AUDIT_PARAM_MAX_LENGTH 1024
++
++/* Check if the argument at position 'argidx' (0-based in c->argv)
++ * is one of the extracted keys. Uses positional matching. */
++static int auditArgIsKey(sds *keys, int numkeys, const char *arg,
++                         int *key_matched)
++{
++    for (int k = 0; k < numkeys; k++) {
++        if (!key_matched[k] && !strcmp(arg, keys[k])) {
++            key_matched[k] = 1;
++            return 1;
++        }
++    }
++    return 0;
++}
++
++/* Build the CommandParam string: command name + space-separated arguments.
++ * Applies truncation and value encryption (masking) as configured. */
++sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
++                           int encryptEnabled)
++{
++    if (c->argc == 0) return sdsempty();
++
++    /* Per-param max length = 1024 / (argc - 1), command name not in denominator */
++    int max_per_arg = (c->argc > 1) ?
++        AUDIT_PARAM_MAX_LENGTH / (c->argc - 1) : AUDIT_PARAM_MAX_LENGTH;
++    if (max_per_arg < 1) max_per_arg = 1;
++
++    sds result = sdsnew(c->argv[0]->ptr); /* command name */
++
++    /* Track which key entries have been matched (positional matching) */
++    int *key_matched = (numkeys > 0) ? zcalloc(sizeof(int) * numkeys) : NULL;
++
++    for (int i = 1; i < c->argc; i++) {
++        result = sdscatlen(result, " ", 1);
++
++        const char *arg = c->argv[i]->ptr;
++        size_t arglen = sdslen(c->argv[i]->ptr);
++
++        int is_key = numkeys > 0 ?
++            auditArgIsKey(keys, numkeys, arg, key_matched) : 0;
++
++        if (arglen <= (size_t)max_per_arg) {
++            /* No truncation needed */
++            if (encryptEnabled && !is_key) {
++                /* Mask: first half plaintext, second half asterisks */
++                int plain_len = (int)arglen / 2;
++                int star_len = (int)arglen - plain_len;
++                char *buf = zmalloc(arglen + 1);
++                memcpy(buf, arg, plain_len);
++                memset(buf + plain_len, '*', star_len);
++                buf[arglen] = '\0';
++                result = sdscat(result, buf);
++                zfree(buf);
++            } else {
++                result = sdscatlen(result, arg, arglen);
++            }
++        } else {
++            /* Truncation needed */
++            size_t display_len = (size_t)max_per_arg;
++            size_t remaining = arglen - display_len;
++            char suffix[64];
++            int suffix_len = snprintf(suffix, sizeof(suffix),
++                "...(%zu more bytes)", remaining);
++
++            if (encryptEnabled && !is_key) {
++                /* Mask + truncation */
++                int plain_len = (int)display_len / 2;
++                int star_len = (int)display_len - plain_len;
++                char *buf = zmalloc(display_len + suffix_len + 1);
++                memcpy(buf, arg, plain_len);
++                memset(buf + plain_len, '*', star_len);
++                memcpy(buf + display_len, suffix, suffix_len);
++                buf[display_len + suffix_len] = '\0';
++                result = sdscat(result, buf);
++                zfree(buf);
++            } else {
++                /* Just truncation, no masking */
++                char *buf = zmalloc(display_len + suffix_len + 1);
++                memcpy(buf, arg, display_len);
++                memcpy(buf + display_len, suffix, suffix_len);
++                buf[display_len + suffix_len] = '\0';
++                result = sdscat(result, buf);
++                zfree(buf);
++            }
++        }
++    }
++
++    zfree(key_matched);
++    return result;
++}
++
+ /* --------------------------------------------------------------------------
+  * Consumer thread
+  * -------------------------------------------------------------------------- */
+diff --git a/src/audit.h b/src/audit.h
+index f331f5ff8..05a69a115 100644
+--- a/src/audit.h
++++ b/src/audit.h
+@@ -42,4 +42,7 @@ const char *auditGetCommandType(const char *cmdName);
+ sds *auditExtractKeys(client *c, int *numkeys);
+ void auditFreeKeys(sds *keys, int numkeys);
+ 
++/* Command param construction, truncation and encryption */
++sds auditBuildCommandParam(client *c, sds *keys, int numkeys, int encryptEnabled);
++
+ #endif /* __AUDIT_H */
+diff --git a/src/debug.c b/src/debug.c
+index 9904541e6..3a137c64b 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -921,6 +921,22 @@ NULL
+             addReplyBulkSds(c, keys[i]);
+         }
+         zfree(keys); /* keys sds were moved to reply, just free array */
++    } else if (!strcasecmp(c->argv[1]->ptr,"audit-param") &&
++               c->argc >= 5)
++    {
++        /* DEBUG AUDIT-PARAM <encrypt:0|1> CMD arg1 arg2 ... */
++        int encryptEnabled = atoi(c->argv[2]->ptr);
++        robj **orig_argv = c->argv;
++        int orig_argc = c->argc;
++        c->argv = c->argv + 3;
++        c->argc = c->argc - 3;
++        int numkeys = 0;
++        sds *keys = auditExtractKeys(c, &numkeys);
++        sds param = auditBuildCommandParam(c, keys, numkeys, encryptEnabled);
++        auditFreeKeys(keys, numkeys);
++        c->argv = orig_argv;
++        c->argc = orig_argc;
++        addReplyBulkSds(c, param);
+     } else {
+         addReplySubcommandSyntaxError(c);
+         return;
+diff --git a/tests/unit/audit-log.tcl b/tests/unit/audit-log.tcl
+index d0291c4b0..f25751d2e 100644
+--- a/tests/unit/audit-log.tcl
++++ b/tests/unit/audit-log.tcl
+@@ -289,3 +289,67 @@ start_server {tags {"audit-log"}} {
+         assert_equal "k3" [lindex $keys 2]
+     }
+ }
++
++start_server {tags {"audit-log"}} {
++    test {DEBUG AUDIT-PARAM: simple command no encryption} {
++        assert_equal "SET mykey myvalue" [r debug audit-param 0 SET mykey myvalue]
++    }
++
++    test {DEBUG AUDIT-PARAM: simple command with encryption} {
++        # "myvalue" = 7 chars: half=3, 3 plain + 4 stars = "myv****"
++        assert_equal "SET mykey myv****" [r debug audit-param 1 SET mykey myvalue]
++    }
++
++    test {DEBUG AUDIT-PARAM: encryption masks even-length value} {
++        # "HelloWorld" = 10 chars: half=5, 5 plain + 5 stars = "Hello*****"
++        assert_equal "SET key Hello*****" [r debug audit-param 1 SET key HelloWorld]
++    }
++
++    test {DEBUG AUDIT-PARAM: key is not encrypted} {
++        # "secret" = 6 chars: half=3, 3 plain + 3 stars = "sec***"
++        assert_equal "SET realkey sec***" [r debug audit-param 1 SET realkey secret]
++    }
++
++    test {DEBUG AUDIT-PARAM: MSET keys not encrypted, values encrypted} {
++        # "v1" = 2 chars: half=1, 1 plain + 1 star = "v*"
++        # "v2" = 2 chars: half=1, 1 plain + 1 star = "v*"
++        assert_equal "MSET k1 v* k2 v*" [r debug audit-param 1 MSET k1 v1 k2 v2]
++    }
++
++    test {DEBUG AUDIT-PARAM: truncation without encryption} {
++        # Build a param that is exactly 5 chars per arg max
++        # For SET with 3 args (SET, key, value), max_per_arg = 1024 / 2 = 512
++        # Use a 10-char value within limit, no truncation
++        assert_equal "SET k abcdefghij" [r debug audit-param 0 SET k abcdefghij]
++    }
++
++    test {DEBUG AUDIT-PARAM: truncation with encryption on long value} {
++        # Create a long value to trigger truncation
++        # For SET k <longval>, max_per_arg = 1024 / 2 = 512
++        # Value >= 512 chars triggers truncation, first half plain + half stars + suffix
++        set longval [string repeat "x" 600]
++        set param [r debug audit-param 1 SET k $longval]
++        # Output: SET k + 256 x's + 256 *'s + ...(88 more bytes)
++        assert_equal [string length $param] [expr {4 + 1 + 1 + 1 + 512 + 17}]
++        # Verify key is in plaintext
++        assert_match "SET k x*x*...(*more bytes)" $param
++    }
++
++    test {DEBUG AUDIT-PARAM: command name not counted in denominator} {
++        # For a command with many args, each arg gets less space
++        # MGET k1 k2: argc=3, max_per_arg = 1024/2 = 512
++        assert_equal "MGET k1 k2" [r debug audit-param 0 MGET k1 k2]
++    }
++
++    test {DEBUG AUDIT-PARAM: DEL all keys not encrypted} {
++        assert_equal "DEL k1 k2 k3" [r debug audit-param 0 DEL k1 k2 k3]
++    }
++
++    test {DEBUG AUDIT-PARAM: DEL with encryption (keys not masked)} {
++        assert_equal "DEL k1 k2 k3" [r debug audit-param 1 DEL k1 k2 k3]
++    }
++
++    test {DEBUG AUDIT-PARAM: BLPOP with encryption} {
++        assert_equal "BLPOP k1 k2 *" [r debug audit-param 1 BLPOP k1 k2 5]
++    }
++}
+-- 
+2.43.0
+
