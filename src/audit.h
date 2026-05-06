@@ -37,4 +37,8 @@ int auditLogEnabledUpdate(int val, int prev, const char **err);
 int auditLogPathUpdate(char *val, char *prev, const char **err);
 int auditLogQueueLengthUpdate(long long val, long long prev, const char **err);
 
+/* Command type mapping */
+void auditCommandTypeInit(void);
+const char *auditGetCommandType(const char *cmdName);
+
 #endif /* __AUDIT_H */

@@ -167,3 +167,109 @@ start_server {tags {"audit-log"}} {
         set _ 1
     } {1}
 }
+
+start_server {tags {"audit-log"}} {
+    test {DEBUG AUDIT-TYPE: string commands} {
+        assert_equal "string" [r debug audit-type SET]
+        assert_equal "string" [r debug audit-type GET]
+        assert_equal "string" [r debug audit-type MSET]
+    }
+
+    test {DEBUG AUDIT-TYPE: hash commands} {
+        assert_equal "hash" [r debug audit-type HGET]
+        assert_equal "hash" [r debug audit-type HSET]
+        assert_equal "hash" [r debug audit-type HDEL]
+    }
+
+    test {DEBUG AUDIT-TYPE: list commands} {
+        assert_equal "list" [r debug audit-type LPUSH]
+        assert_equal "list" [r debug audit-type RPOP]
+        assert_equal "list" [r debug audit-type BLPOP]
+    }
+
+    test {DEBUG AUDIT-TYPE: set commands} {
+        assert_equal "set" [r debug audit-type SADD]
+        assert_equal "set" [r debug audit-type SMEMBERS]
+    }
+
+    test {DEBUG AUDIT-TYPE: sorted-set commands} {
+        assert_equal "sorted-set" [r debug audit-type ZADD]
+        assert_equal "sorted-set" [r debug audit-type ZRANGE]
+    }
+
+    test {DEBUG AUDIT-TYPE: bitmap commands} {
+        assert_equal "bitmap" [r debug audit-type BITCOUNT]
+        assert_equal "bitmap" [r debug audit-type SETBIT]
+    }
+
+    test {DEBUG AUDIT-TYPE: hyperloglog commands} {
+        assert_equal "hyperloglog" [r debug audit-type PFADD]
+        assert_equal "hyperloglog" [r debug audit-type PFCOUNT]
+    }
+
+    test {DEBUG AUDIT-TYPE: geo commands} {
+        assert_equal "geo" [r debug audit-type GEOADD]
+        assert_equal "geo" [r debug audit-type GEODIST]
+    }
+
+    test {DEBUG AUDIT-TYPE: stream commands} {
+        assert_equal "stream" [r debug audit-type XADD]
+        assert_equal "stream" [r debug audit-type XREAD]
+    }
+
+    test {DEBUG AUDIT-TYPE: pubsub commands} {
+        assert_equal "pubsub" [r debug audit-type PUBLISH]
+        assert_equal "pubsub" [r debug audit-type SUBSCRIBE]
+    }
+
+    test {DEBUG AUDIT-TYPE: scripting commands} {
+        assert_equal "scripting" [r debug audit-type EVAL]
+        assert_equal "scripting" [r debug audit-type EVALSHA]
+    }
+
+    test {DEBUG AUDIT-TYPE: transactions commands} {
+        assert_equal "transactions" [r debug audit-type MULTI]
+        assert_equal "transactions" [r debug audit-type EXEC]
+    }
+
+    test {DEBUG AUDIT-TYPE: connection commands} {
+        assert_equal "connection" [r debug audit-type PING]
+        assert_equal "connection" [r debug audit-type SELECT]
+    }
+
+    test {DEBUG AUDIT-TYPE: server commands} {
+        assert_equal "server" [r debug audit-type INFO]
+        assert_equal "server" [r debug audit-type CONFIG]
+    }
+
+    test {DEBUG AUDIT-TYPE: generic commands} {
+        assert_equal "generic" [r debug audit-type DEL]
+        assert_equal "generic" [r debug audit-type EXISTS]
+    }
+
+    test {DEBUG AUDIT-TYPE: cluster commands} {
+        assert_equal "cluster" [r debug audit-type CLUSTER]
+    }
+
+    test {DEBUG AUDIT-TYPE: module commands (bf/cf/json/search/timeseries/topk)} {
+        assert_equal "bf" [r debug audit-type BF.ADD]
+        assert_equal "cf" [r debug audit-type CF.ADD]
+        assert_equal "json" [r debug audit-type JSON.SET]
+        assert_equal "search" [r debug audit-type FT.SEARCH]
+        assert_equal "timeseries" [r debug audit-type TS.ADD]
+        assert_equal "topk" [r debug audit-type TOPK.ADD]
+    }
+
+    test {DEBUG AUDIT-TYPE: case insensitive lookup} {
+        assert_equal "string" [r debug audit-type set]
+        assert_equal "string" [r debug audit-type Set]
+        assert_equal "hash" [r debug audit-type hget]
+        assert_equal "hash" [r debug audit-type Hget]
+        assert_equal "sorted-set" [r debug audit-type zadd]
+    }
+
+    test {DEBUG AUDIT-TYPE: unknown command returns undefined} {
+        assert_equal "undefined" [r debug audit-type UNKNOWNCMD]
+        assert_equal "undefined" [r debug audit-type NOTACMD]
+    }
+}
