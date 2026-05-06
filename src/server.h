@@ -1639,6 +1639,14 @@ struct redisServer {
                                 * failover then any replica can be used. */
     int target_replica_port; /* Failover target port */
     int failover_state; /* Failover state */
+    /* Audit log */
+    int audit_log_enabled;                /* Audit log enabled */
+    char *audit_log_path;                 /* Audit log file path */
+    int audit_log_encrypt_enabled;        /* Audit log encrypt enabled */
+    int audit_log_queue_length;           /* Audit log queue length */
+    char *audit_log_customer_command_list; /* Extra commands to audit */
+    long long audit_log_abort_count;      /* Audit log discard counter */
+    long long audit_log_record_count;     /* Audit log enqueue counter */
 };
 
 #define MAX_KEYS_BUFFER 256
