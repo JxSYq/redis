@@ -42,4 +42,7 @@ const char *auditGetCommandType(const char *cmdName);
 sds *auditExtractKeys(client *c, int *numkeys);
 void auditFreeKeys(sds *keys, int numkeys);
 
+/* Command param construction, truncation and encryption */
+sds auditBuildCommandParam(client *c, sds *keys, int numkeys, int encryptEnabled);
+
 #endif /* __AUDIT_H */
