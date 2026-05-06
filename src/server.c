@@ -5390,6 +5390,24 @@ sds genRedisInfoString(const char *section) {
         }
     }
 
+    /* Audit log */
+    if (allsections || defsections || !strcasecmp(section,"audit_log")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Audit_log\r\n");
+        info = sdscatprintf(info,
+            "audit_log_enabled:%s\r\n",
+            server.audit_log_enabled ? "yes" : "no");
+        info = sdscatprintf(info,
+            "audit_log_record_count:%lld\r\n",
+            server.audit_log_record_count);
+        info = sdscatprintf(info,
+            "audit_log_abort_count:%lld\r\n",
+            server.audit_log_abort_count);
+        info = sdscatprintf(info,
+            "audit_log_queue_length:%d\r\n",
+            auditLogQueueLen());
+    }
+
     /* Get info from modules.
      * if user asked for "everything" or "modules", or a specific section
      * that's not found yet. */
