@@ -393,3 +393,67 @@ start_server {tags {"audit-log"}} {
         assert_equal "k3" [lindex $keys 2]
     }
 }
+
+start_server {tags {"audit-log"}} {
+    test {DEBUG AUDIT-PARAM: simple command no encryption} {
+        assert_equal "SET mykey myvalue" [r debug audit-param 0 SET mykey myvalue]
+    }
+
+    test {DEBUG AUDIT-PARAM: simple command with encryption} {
+        # "myvalue" = 7 chars: half=3, 3 plain + 4 stars = "myv****"
+        assert_equal "SET mykey myv****" [r debug audit-param 1 SET mykey myvalue]
+    }
+
+    test {DEBUG AUDIT-PARAM: encryption masks even-length value} {
+        # "HelloWorld" = 10 chars: half=5, 5 plain + 5 stars = "Hello*****"
+        assert_equal "SET key Hello*****" [r debug audit-param 1 SET key HelloWorld]
+    }
+
+    test {DEBUG AUDIT-PARAM: key is not encrypted} {
+        # "secret" = 6 chars: half=3, 3 plain + 3 stars = "sec***"
+        assert_equal "SET realkey sec***" [r debug audit-param 1 SET realkey secret]
+    }
+
+    test {DEBUG AUDIT-PARAM: MSET keys not encrypted, values encrypted} {
+        # "v1" = 2 chars: half=1, 1 plain + 1 star = "v*"
+        # "v2" = 2 chars: half=1, 1 plain + 1 star = "v*"
+        assert_equal "MSET k1 v* k2 v*" [r debug audit-param 1 MSET k1 v1 k2 v2]
+    }
+
+    test {DEBUG AUDIT-PARAM: truncation without encryption} {
+        # Build a param that is exactly 5 chars per arg max
+        # For SET with 3 args (SET, key, value), max_per_arg = 1024 / 2 = 512
+        # Use a 10-char value within limit, no truncation
+        assert_equal "SET k abcdefghij" [r debug audit-param 0 SET k abcdefghij]
+    }
+
+    test {DEBUG AUDIT-PARAM: truncation with encryption on long value} {
+        # Create a long value to trigger truncation
+        # For SET k <longval>, max_per_arg = 1024 / 2 = 512
+        # Value >= 512 chars triggers truncation, first half plain + half stars + suffix
+        set longval [string repeat "x" 600]
+        set param [r debug audit-param 1 SET k $longval]
+        # Output: SET k + 256 x's + 256 *'s + ...(88 more bytes)
+        assert_equal [string length $param] [expr {4 + 1 + 1 + 1 + 512 + 17}]
+        # Verify key is in plaintext
+        assert_match "SET k x*x*...(*more bytes)" $param
+    }
+
+    test {DEBUG AUDIT-PARAM: command name not counted in denominator} {
+        # For a command with many args, each arg gets less space
+        # MGET k1 k2: argc=3, max_per_arg = 1024/2 = 512
+        assert_equal "MGET k1 k2" [r debug audit-param 0 MGET k1 k2]
+    }
+
+    test {DEBUG AUDIT-PARAM: DEL all keys not encrypted} {
+        assert_equal "DEL k1 k2 k3" [r debug audit-param 0 DEL k1 k2 k3]
+    }
+
+    test {DEBUG AUDIT-PARAM: DEL with encryption (keys not masked)} {
+        assert_equal "DEL k1 k2 k3" [r debug audit-param 1 DEL k1 k2 k3]
+    }
+
+    test {DEBUG AUDIT-PARAM: BLPOP with encryption} {
+        assert_equal "BLPOP k1 k2 *" [r debug audit-param 1 BLPOP k1 k2 5]
+    }
+}

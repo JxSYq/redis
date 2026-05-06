@@ -949,6 +949,102 @@ void auditFreeKeys(sds *keys, int numkeys) {
 }
 
 /* --------------------------------------------------------------------------
+ * CommandParam construction, truncation and encryption
+ * -------------------------------------------------------------------------- */
+
+#define AUDIT_PARAM_MAX_LENGTH 1024
+
+/* Check if the argument at position 'argidx' (0-based in c->argv)
+ * is one of the extracted keys. Uses positional matching. */
+static int auditArgIsKey(sds *keys, int numkeys, const char *arg,
+                         int *key_matched)
+{
+    for (int k = 0; k < numkeys; k++) {
+        if (!key_matched[k] && !strcmp(arg, keys[k])) {
+            key_matched[k] = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Build the CommandParam string: command name + space-separated arguments.
+ * Applies truncation and value encryption (masking) as configured. */
+sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
+                           int encryptEnabled)
+{
+    if (c->argc == 0) return sdsempty();
+
+    /* Per-param max length = 1024 / (argc - 1), command name not in denominator */
+    int max_per_arg = (c->argc > 1) ?
+        AUDIT_PARAM_MAX_LENGTH / (c->argc - 1) : AUDIT_PARAM_MAX_LENGTH;
+    if (max_per_arg < 1) max_per_arg = 1;
+
+    sds result = sdsnew(c->argv[0]->ptr); /* command name */
+
+    /* Track which key entries have been matched (positional matching) */
+    int *key_matched = (numkeys > 0) ? zcalloc(sizeof(int) * numkeys) : NULL;
+
+    for (int i = 1; i < c->argc; i++) {
+        result = sdscatlen(result, " ", 1);
+
+        const char *arg = c->argv[i]->ptr;
+        size_t arglen = sdslen(c->argv[i]->ptr);
+
+        int is_key = numkeys > 0 ?
+            auditArgIsKey(keys, numkeys, arg, key_matched) : 0;
+
+        if (arglen <= (size_t)max_per_arg) {
+            /* No truncation needed */
+            if (encryptEnabled && !is_key) {
+                /* Mask: first half plaintext, second half asterisks */
+                int plain_len = (int)arglen / 2;
+                int star_len = (int)arglen - plain_len;
+                char *buf = zmalloc(arglen + 1);
+                memcpy(buf, arg, plain_len);
+                memset(buf + plain_len, '*', star_len);
+                buf[arglen] = '\0';
+                result = sdscat(result, buf);
+                zfree(buf);
+            } else {
+                result = sdscatlen(result, arg, arglen);
+            }
+        } else {
+            /* Truncation needed */
+            size_t display_len = (size_t)max_per_arg;
+            size_t remaining = arglen - display_len;
+            char suffix[64];
+            int suffix_len = snprintf(suffix, sizeof(suffix),
+                "...(%zu more bytes)", remaining);
+
+            if (encryptEnabled && !is_key) {
+                /* Mask + truncation */
+                int plain_len = (int)display_len / 2;
+                int star_len = (int)display_len - plain_len;
+                char *buf = zmalloc(display_len + suffix_len + 1);
+                memcpy(buf, arg, plain_len);
+                memset(buf + plain_len, '*', star_len);
+                memcpy(buf + display_len, suffix, suffix_len);
+                buf[display_len + suffix_len] = '\0';
+                result = sdscat(result, buf);
+                zfree(buf);
+            } else {
+                /* Just truncation, no masking */
+                char *buf = zmalloc(display_len + suffix_len + 1);
+                memcpy(buf, arg, display_len);
+                memcpy(buf + display_len, suffix, suffix_len);
+                buf[display_len + suffix_len] = '\0';
+                result = sdscat(result, buf);
+                zfree(buf);
+            }
+        }
+    }
+
+    zfree(key_matched);
+    return result;
+}
+
+/* --------------------------------------------------------------------------
  * Consumer thread
  * -------------------------------------------------------------------------- */
 
