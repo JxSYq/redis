@@ -475,3 +475,90 @@ start_server {tags {"audit-log"}} {
     r config set audit-log-enabled no
     r config set audit-log-path ""
 }
+
+start_server {tags {"audit-log"}} {
+    test {Audit: end-to-end flow with file verification} {
+        set logpath "/tmp/test_audit_e2e.log"
+        file delete $logpath
+        r config set audit-log-path $logpath
+        r config set audit-log-enabled yes
+        r SET e2ekey e2evalue
+        after 300
+        set fp [open $logpath r]
+        set content [read $fp]
+        close $fp
+        assert_match {*"command_name":"SET"*} $content
+        assert_match {*"command_keys":\["e2ekey"\]*} $content
+        assert_match {*"proxy_addr"*} $content
+        assert_match {*"user"*} $content
+        file delete $logpath
+    }
+
+    test {Audit: transaction same time and isTrans} {
+        set logpath "/tmp/test_audit_trans.log"
+        file delete $logpath
+        r config set audit-log-path $logpath
+        printf "MULTI\r\nSET trans1 v1\r\nSET trans2 v2\r\nEXEC\r\n" | [redis [srv "host"] [srv "port"]]
+        after 300
+        set fp [open $logpath r]
+        set lines [split [read $fp] "\n"]
+        close $fp
+        # Find both transaction lines
+        set t1 {}
+        set t2 {}
+        foreach line $lines {
+            if {[string first "trans1" $line] != -1} { set t1 $line }
+            if {[string first "trans2" $line] != -1} { set t2 $line }
+        }
+        assert_match {*"isTrans"*} $t1
+        assert_match {*"isTrans"*} $t2
+        file delete $logpath
+    }
+
+    test {Audit: customer command list dynamic update} {
+        set logpath "/tmp/test_audit_cust.log"
+        file delete $logpath
+        r config set audit-log-path $logpath
+        r config set audit-log-customer-command-list ""
+        # GET should NOT be logged normally
+        r GET e2ekey
+        after 200
+        assert {![file exists $logpath] || [file size $logpath] == 0}
+        # Add GET to customer list
+        r config set audit-log-customer-command-list "GET"
+        r GET e2ekey
+        after 200
+        set fp [open $logpath r]
+        set content [read $fp]
+        close $fp
+        assert_match {*"command_name":"GET"*} $content
+        file delete $logpath
+        r config set audit-log-customer-command-list ""
+    }
+
+    test {Audit: INFO audit_log section is accessible} {
+        assert_match {*audit_log_enabled*} [r info audit_log]
+        assert_match {*audit_log_record_count*} [r info audit_log]
+        assert_match {*audit_log_abort_count*} [r info audit_log]
+        assert_match {*audit_log_queue_length*} [r info audit_log]
+    }
+
+    test {Audit: CONFIG GET audit-log-abort-count returns correct value} {
+        r config set audit-log-queue-length 1
+        r config set audit-log-enabled yes
+        set logpath "/tmp/test_audit_abort.log"
+        r config set audit-log-path $logpath
+        # Queue size is 1, push 3 entries to fill and overflow
+        r SET abort1 v1
+        r SET abort2 v2
+        r SET abort3 v3
+        after 300
+        set abort_count [lindex [r config get audit-log-abort-count] 1]
+        assert {$abort_count > 0}
+        r config set audit-log-queue-length 100000
+        file delete $logpath
+    }
+
+    r config set audit-log-enabled no
+    r config set audit-log-path ""
+}
