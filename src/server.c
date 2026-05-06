@@ -3373,7 +3373,8 @@ void initServer(void) {
     scriptingInit(1);
     slowlogInit();
     latencyMonitorInit();
-    
+    auditCommandTypeInit();
+
     /* Initialize ACL default password if it exists */
     ACLUpdateDefaultUserPassword(server.requirepass);
 }
