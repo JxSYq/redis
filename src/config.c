@@ -2567,6 +2567,14 @@ standardConfig configs[] = {
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, updateTlsCfg),
 #endif
 
+    /* Audit log configs */
+    createBoolConfig("audit-log-enabled", NULL, MODIFIABLE_CONFIG, server.audit_log_enabled, 0, NULL, NULL),
+    createStringConfig("audit-log-path", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.audit_log_path, "", NULL, NULL),
+    createBoolConfig("audit-log-encrypt-enabled", NULL, MODIFIABLE_CONFIG, server.audit_log_encrypt_enabled, 1, NULL, NULL),
+    createIntConfig("audit-log-queue-length", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.audit_log_queue_length, 100000, INTEGER_CONFIG, NULL, NULL),
+    createStringConfig("audit-log-customer-command-list", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.audit_log_customer_command_list, "", NULL, NULL),
+    createLongLongConfig("audit-log-abort-count", NULL, IMMUTABLE_CONFIG, 0, LLONG_MAX, server.audit_log_abort_count, 0, INTEGER_CONFIG, NULL, NULL),
+
     /* NULL Terminator */
     {NULL}
 };
