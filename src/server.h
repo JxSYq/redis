@@ -2781,4 +2781,7 @@ int tlsConfigure(redisTLSContextConfig *ctx_config);
 
 int iAmMaster(void);
 
+/* Audit log API */
+#include "audit.h"
+
 #endif
