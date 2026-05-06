@@ -85,4 +85,37 @@ void auditLogCommand(client *c);
 void auditLogTransactionCommand(client *c, long long prev_err_count);
 long long auditNanoTime(void);
 
+/*
+ * Extension points for future enhancements:
+ *
+ * 1. Log output target abstraction:
+ *    Currently only local file is supported. To add network output (syslog,
+ *    kafka, etc.), implement an auditLogWriter interface with function
+ *    pointers for open/write/close and register via auditLogSetWriter().
+ *
+ * 2. Command blacklist:
+ *    Add audit-log-blacklist config to exclude specific write commands.
+ *    Implement auditShouldLog() blacklist check before whitelist check.
+ *
+ * 3. Sampling rate:
+ *    Add audit-log-sample-rate config (0-100). Implement random sampling
+ *    in auditLogCommand() to log only a percentage of commands.
+ *
+ * 4. Log rotation:
+ *    Add audit-log-max-size and audit-log-rotate-count configs.
+ *    Implement size-based rotation in auditLogFileWrite().
+ *
+ * 5. Custom fields via extend:
+ *    The 'extend' field provides structured extension. Parsers can check
+ *    for 'isTrans' and other future values.
+ *
+ * 6. Slow log threshold:
+ *    Add audit-log-min-use-time config. Filter entries by use_time
+ *    threshold in auditLogCommand().
+ *
+ * 7. Client filtering:
+ *    Add audit-log-client-filter config (address or user based).
+ *    Check client_addr/user in auditShouldLog().
+ */
+
 #endif /* __AUDIT_H */
