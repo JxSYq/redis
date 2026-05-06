@@ -199,6 +199,7 @@ void execCommand(client *c) {
     unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
 
     server.in_exec = 1;
+    server.audit_exec_time = mstime();
 
     orig_argv = c->argv;
     orig_argc = c->argc;
@@ -237,8 +238,11 @@ void execCommand(client *c) {
                 "This command is no longer allowed for the "
                 "following reason: %s", reason);
         } else {
+            long long prev_err = server.stat_total_error_replies;
             call(c,server.loading ? CMD_CALL_NONE : CMD_CALL_FULL);
             serverAssert((c->flags & CLIENT_BLOCKED) == 0);
+
+            auditLogTransactionCommand(c, prev_err);
         }
 
         /* Commands may alter argc/argv, restore mstate. */
@@ -274,6 +278,7 @@ void execCommand(client *c) {
     }
 
     server.in_exec = 0;
+    server.audit_exec_time = 0;
 }
 
 /* ===================== WATCH (CAS alike for MULTI/EXEC) ===================

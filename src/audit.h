@@ -82,6 +82,7 @@ void auditFreeEntry(auditLogEntry *entry);
 void auditRebuildCustomerCommandDict(void);
 int auditShouldLog(client *c);
 void auditLogCommand(client *c);
+void auditLogTransactionCommand(client *c, long long prev_err_count);
 long long auditNanoTime(void);
 
 #endif /* __AUDIT_H */
