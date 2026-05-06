@@ -273,3 +273,123 @@ start_server {tags {"audit-log"}} {
         assert_equal "undefined" [r debug audit-type NOTACMD]
     }
 }
+
+start_server {tags {"audit-log"}} {
+    test {DEBUG AUDIT-KEYS: single key command (SET)} {
+        set keys [r debug audit-keys SET mykey myvalue]
+        assert_equal 1 [llength $keys]
+        assert_equal "mykey" [lindex $keys 0]
+    }
+
+    test {DEBUG AUDIT-KEYS: multi-key command (DEL)} {
+        set keys [r debug audit-keys DEL k1 k2 k3]
+        assert_equal 3 [llength $keys]
+        assert_equal "k1" [lindex $keys 0]
+        assert_equal "k2" [lindex $keys 1]
+        assert_equal "k3" [lindex $keys 2]
+    }
+
+    test {DEBUG AUDIT-KEYS: MSET odd positions} {
+        set keys [r debug audit-keys MSET k1 v1 k2 v2 k3 v3]
+        assert_equal 3 [llength $keys]
+        assert_equal "k1" [lindex $keys 0]
+        assert_equal "k2" [lindex $keys 1]
+        assert_equal "k3" [lindex $keys 2]
+    }
+
+    test {DEBUG AUDIT-KEYS: SMOVE first two args} {
+        set keys [r debug audit-keys SMOVE src dst member]
+        assert_equal 2 [llength $keys]
+        assert_equal "src" [lindex $keys 0]
+        assert_equal "dst" [lindex $keys 1]
+    }
+
+    test {DEBUG AUDIT-KEYS: BLPOP all but last} {
+        set keys [r debug audit-keys BLPOP k1 k2 5]
+        assert_equal 2 [llength $keys]
+        assert_equal "k1" [lindex $keys 0]
+        assert_equal "k2" [lindex $keys 1]
+    }
+
+    test {DEBUG AUDIT-KEYS: BRPOPLPUSH first two} {
+        set keys [r debug audit-keys BRPOPLPUSH src dst timeout]
+        assert_equal 2 [llength $keys]
+        assert_equal "src" [lindex $keys 0]
+        assert_equal "dst" [lindex $keys 1]
+    }
+
+    test {DEBUG AUDIT-KEYS: ZUNIONSTORE destkey + numkeys} {
+        set keys [r debug audit-keys ZUNIONSTORE dest 3 k1 k2 k3]
+        assert_equal 4 [llength $keys]
+        assert_equal "dest" [lindex $keys 0]
+        assert_equal "k1" [lindex $keys 1]
+        assert_equal "k2" [lindex $keys 2]
+        assert_equal "k3" [lindex $keys 3]
+    }
+
+    test {DEBUG AUDIT-KEYS: ZUNION numkeys-based} {
+        set keys [r debug audit-keys ZUNION 2 k1 k2]
+        assert_equal 2 [llength $keys]
+        assert_equal "k1" [lindex $keys 0]
+        assert_equal "k2" [lindex $keys 1]
+    }
+
+    test {DEBUG AUDIT-KEYS: BITOP from 2nd arg} {
+        set keys [r debug audit-keys BITOP AND dest k1 k2 k3]
+        assert_equal 4 [llength $keys]
+        assert_equal "dest" [lindex $keys 0]
+        assert_equal "k1" [lindex $keys 1]
+        assert_equal "k2" [lindex $keys 2]
+        assert_equal "k3" [lindex $keys 3]
+    }
+
+    test {DEBUG AUDIT-KEYS: SORT first arg} {
+        set keys [r debug audit-keys SORT mykey LIMIT 0 10 STORE dest]
+        assert_equal 1 [llength $keys]
+        assert_equal "mykey" [lindex $keys 0]
+    }
+
+    test {DEBUG AUDIT-KEYS: XREAD STREAMS keys} {
+        set keys [r debug audit-keys XREAD COUNT 2 STREAMS s1 s2 0 0]
+        assert_equal 2 [llength $keys]
+        assert_equal "s1" [lindex $keys 0]
+        assert_equal "s2" [lindex $keys 1]
+    }
+
+    test {DEBUG AUDIT-KEYS: XREADGROUP STREAMS keys} {
+        set keys [r debug audit-keys XREADGROUP GROUP g c STREAMS s1 s2 s3 0 0 0]
+        assert_equal 3 [llength $keys]
+        assert_equal "s1" [lindex $keys 0]
+        assert_equal "s2" [lindex $keys 1]
+        assert_equal "s3" [lindex $keys 2]
+    }
+
+    test {DEBUG AUDIT-KEYS: EXISTS all args are keys} {
+        set keys [r debug audit-keys EXISTS k1 k2]
+        assert_equal 2 [llength $keys]
+        assert_equal "k1" [lindex $keys 0]
+        assert_equal "k2" [lindex $keys 1]
+    }
+
+    test {DEBUG AUDIT-KEYS: UNLINK all args are keys} {
+        set keys [r debug audit-keys UNLINK k1 k2]
+        assert_equal 2 [llength $keys]
+        assert_equal "k1" [lindex $keys 0]
+        assert_equal "k2" [lindex $keys 1]
+    }
+
+    test {DEBUG AUDIT-KEYS: TOUCH all args are keys} {
+        set keys [r debug audit-keys TOUCH k1 k2]
+        assert_equal 2 [llength $keys]
+        assert_equal "k1" [lindex $keys 0]
+        assert_equal "k2" [lindex $keys 1]
+    }
+
+    test {DEBUG AUDIT-KEYS: MGET all args are keys} {
+        set keys [r debug audit-keys MGET k1 k2 k3]
+        assert_equal 3 [llength $keys]
+        assert_equal "k1" [lindex $keys 0]
+        assert_equal "k2" [lindex $keys 1]
+        assert_equal "k3" [lindex $keys 2]
+    }
+}

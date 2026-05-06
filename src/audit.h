@@ -41,4 +41,8 @@ int auditLogQueueLengthUpdate(long long val, long long prev, const char **err);
 void auditCommandTypeInit(void);
 const char *auditGetCommandType(const char *cmdName);
 
+/* Command keys extraction */
+sds *auditExtractKeys(client *c, int *numkeys);
+void auditFreeKeys(sds *keys, int numkeys);
+
 #endif /* __AUDIT_H */
