@@ -246,9 +246,9 @@ int auditLogEnabledUpdate(int val, int prev, const char **err) {
     UNUSED(prev);
     UNUSED(err);
     if (!val) {
-        /* When disabled, close the file. The consumer thread will
-         * still drain the queue but won't write to file. */
         auditLogFileClose();
+    } else if (server.audit_log_path && server.audit_log_path[0] != '\0') {
+        auditLogFileOpen(server.audit_log_path);
     }
     return 1;
 }
@@ -1256,14 +1256,34 @@ static int auditResponseIsEmpty(client *c) {
 
 /* Trigger audit logging for a command after execution. */
 void auditLogCommand(client *c) {
+    /* Transactions are handled in execCommand */
+    if (server.in_exec) return;
+
     if (!auditShouldLog(c)) return;
     if (auditResponseIsError(c)) return;
     if (auditResponseIsEmpty(c)) return;
 
     auditLogEntry *entry = auditCreateEntry(c);
     entry->use_time = (auditNanoTime() - c->audit_start_time) / 1000;
+    entry->raw = auditEntryToJSON(entry);
 
-    /* Serialize to JSON before pushing */
+    if (!auditLogQueuePush(entry)) {
+        auditFreeEntry(entry);
+    }
+}
+
+/* Audit a single command executed within a transaction (EXEC). */
+void auditLogTransactionCommand(client *c, long long prev_err_count) {
+    if (!auditShouldLog(c)) return;
+
+    /* Check if this sub-command produced an error */
+    if (server.stat_total_error_replies != prev_err_count) return;
+
+    auditLogEntry *entry = auditCreateEntry(c);
+    entry->time = (long long)server.audit_exec_time * 1000000LL;
+    sdsfree(entry->extend);
+    entry->extend = sdsnew("isTrans");
+    entry->use_time = (auditNanoTime() - c->audit_start_time) / 1000;
     entry->raw = auditEntryToJSON(entry);
 
     if (!auditLogQueuePush(entry)) {

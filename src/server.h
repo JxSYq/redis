@@ -1646,6 +1646,7 @@ struct redisServer {
     char *audit_log_customer_command_list; /* Extra commands to audit */
     long long audit_log_abort_count;      /* Audit log discard counter */
     long long audit_log_record_count;     /* Audit log enqueue counter */
+    mstime_t audit_exec_time;             /* EXEC start time for transaction audit */
 };
 
 #define MAX_KEYS_BUFFER 256
