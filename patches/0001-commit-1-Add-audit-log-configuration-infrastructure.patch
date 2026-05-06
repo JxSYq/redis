@@ -1,0 +1,132 @@
+From 3f27639419542d16858c9a506956d3f3a6dd75e3 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 16:41:25 +0800
+Subject: [PATCH 01/12] commit 1: Add audit log configuration infrastructure
+
+- Add audit log fields to redisServer struct (audit_log_enabled,
+  audit_log_path, audit_log_encrypt_enabled, audit_log_queue_length,
+  audit_log_customer_command_list, audit_log_abort_count,
+  audit_log_record_count)
+- Register all config items in config.c supporting CONFIG SET/GET
+  and config file loading
+- audit-log-abort-count is immutable (read-only)
+- Add basic config test cases in tests/unit/audit-log.tcl
+---
+ src/config.c             |  8 +++++
+ src/server.h             |  8 +++++
+ tests/unit/audit-log.tcl | 65 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 81 insertions(+)
+ create mode 100644 tests/unit/audit-log.tcl
+
+diff --git a/src/config.c b/src/config.c
+index 691b8a045..6e12e1a51 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -2567,6 +2567,14 @@ standardConfig configs[] = {
+     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, updateTlsCfg),
+ #endif
+ 
++    /* Audit log configs */
++    createBoolConfig("audit-log-enabled", NULL, MODIFIABLE_CONFIG, server.audit_log_enabled, 0, NULL, NULL),
++    createStringConfig("audit-log-path", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.audit_log_path, "", NULL, NULL),
++    createBoolConfig("audit-log-encrypt-enabled", NULL, MODIFIABLE_CONFIG, server.audit_log_encrypt_enabled, 1, NULL, NULL),
++    createIntConfig("audit-log-queue-length", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.audit_log_queue_length, 100000, INTEGER_CONFIG, NULL, NULL),
++    createStringConfig("audit-log-customer-command-list", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.audit_log_customer_command_list, "", NULL, NULL),
++    createLongLongConfig("audit-log-abort-count", NULL, IMMUTABLE_CONFIG, 0, LLONG_MAX, server.audit_log_abort_count, 0, INTEGER_CONFIG, NULL, NULL),
++
+     /* NULL Terminator */
+     {NULL}
+ };
+diff --git a/src/server.h b/src/server.h
+index 1b4f5fed9..4e6ac2fae 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -1636,6 +1636,14 @@ struct redisServer {
+                                 * failover then any replica can be used. */
+     int target_replica_port; /* Failover target port */
+     int failover_state; /* Failover state */
++    /* Audit log */
++    int audit_log_enabled;                /* Audit log enabled */
++    char *audit_log_path;                 /* Audit log file path */
++    int audit_log_encrypt_enabled;        /* Audit log encrypt enabled */
++    int audit_log_queue_length;           /* Audit log queue length */
++    char *audit_log_customer_command_list; /* Extra commands to audit */
++    long long audit_log_abort_count;      /* Audit log discard counter */
++    long long audit_log_record_count;     /* Audit log enqueue counter */
+ };
+ 
+ #define MAX_KEYS_BUFFER 256
+diff --git a/tests/unit/audit-log.tcl b/tests/unit/audit-log.tcl
+new file mode 100644
+index 000000000..c4a47acb6
+--- /dev/null
++++ b/tests/unit/audit-log.tcl
+@@ -0,0 +1,65 @@
++start_server {tags {"audit-log"}} {
++    test {CONFIG GET audit-log-enabled default} {
++        assert_equal "no" [lindex [r config get audit-log-enabled] 1]
++    }
++
++    test {CONFIG SET audit-log-enabled yes} {
++        r config set audit-log-enabled yes
++        assert_equal "yes" [lindex [r config get audit-log-enabled] 1]
++    }
++
++    test {CONFIG SET audit-log-enabled no} {
++        r config set audit-log-enabled no
++        assert_equal "no" [lindex [r config get audit-log-enabled] 1]
++    }
++
++    test {CONFIG GET audit-log-path default} {
++        assert_equal "" [lindex [r config get audit-log-path] 1]
++    }
++
++    test {CONFIG SET audit-log-path} {
++        r config set audit-log-path /tmp/test_audit.log
++        assert_equal "/tmp/test_audit.log" [lindex [r config get audit-log-path] 1]
++    }
++
++    test {CONFIG GET audit-log-encrypt-enabled default} {
++        assert_equal "yes" [lindex [r config get audit-log-encrypt-enabled] 1]
++    }
++
++    test {CONFIG SET audit-log-encrypt-enabled no} {
++        r config set audit-log-encrypt-enabled no
++        assert_equal "no" [lindex [r config get audit-log-encrypt-enabled] 1]
++    }
++
++    test {CONFIG SET audit-log-encrypt-enabled back to yes} {
++        r config set audit-log-encrypt-enabled yes
++        assert_equal "yes" [lindex [r config get audit-log-encrypt-enabled] 1]
++    }
++
++    test {CONFIG GET audit-log-queue-length default} {
++        assert_equal "100000" [lindex [r config get audit-log-queue-length] 1]
++    }
++
++    test {CONFIG SET audit-log-queue-length} {
++        r config set audit-log-queue-length 50000
++        assert_equal "50000" [lindex [r config get audit-log-queue-length] 1]
++    }
++
++    test {CONFIG GET audit-log-customer-command-list default} {
++        assert_equal "" [lindex [r config get audit-log-customer-command-list] 1]
++    }
++
++    test {CONFIG SET audit-log-customer-command-list} {
++        r config set audit-log-customer-command-list "GET INFO"
++        assert_equal "GET INFO" [lindex [r config get audit-log-customer-command-list] 1]
++    }
++
++    test {CONFIG GET audit-log-abort-count default} {
++        assert_equal "0" [lindex [r config get audit-log-abort-count] 1]
++    }
++
++    test {CONFIG SET audit-log-abort-count is rejected} {
++        catch {r config set audit-log-abort-count 100} err
++        set _ $err
++    } {ERR*Unsupported CONFIG*}
++}
+-- 
+2.43.0
+
