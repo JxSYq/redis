@@ -4,8 +4,31 @@
 
 #include "sds.h"
 
-/* Audit log entry. At this stage, it only contains the JSON string. */
+#define AUDIT_CLIENT_TYPE_NORMAL "0"
+#define AUDIT_CLIENT_TYPE_SLAVE  "1"
+#define AUDIT_CLIENT_TYPE_PUBSUB "2"
+#define AUDIT_CLIENT_TYPE_MASTER "3"
+
 typedef struct auditLogEntry {
+    /* Business fields */
+    long long time;             /* Command arrival time (nanoseconds since epoch) */
+    sds instance_id;            /* Redis instance identifier */
+    sds proxy_addr;             /* Redis listen address (ip:port) */
+    sds server_addr;            /* Actual server address */
+    sds role;                   /* "master" or "slave" */
+    sds client_addr;            /* Client remote address (ip:port) */
+    sds client_type;            /* Client type code */
+    sds user;                   /* Authenticated username */
+    int db;                     /* Selected database number */
+    sds command_name;           /* Command name (e.g. SET) */
+    sds command_type;           /* Command type (e.g. string) */
+    int num_keys;               /* Number of keys */
+    sds *command_keys;          /* Array of key names */
+    sds command_param;          /* Full command param string */
+    long long use_time;         /* Command execution time (microseconds) */
+    sds extend;                 /* Extension info (isTrans for transactions) */
+
+    /* Serialized output */
     sds raw;                    /* JSON serialized audit log line */
 } auditLogEntry;
 
@@ -48,5 +71,10 @@ void auditFreeKeys(sds *keys, int numkeys, int *key_positions);
 /* Command param construction, truncation and encryption */
 sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
                            int *key_positions, int encryptEnabled);
+
+/* Audit entry lifecycle */
+auditLogEntry *auditCreateEntry(client *c);
+sds auditEntryToJSON(auditLogEntry *entry);
+void auditFreeEntry(auditLogEntry *entry);
 
 #endif /* __AUDIT_H */

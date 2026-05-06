@@ -926,7 +926,6 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"audit-param") &&
                c->argc >= 5)
     {
-        /* DEBUG AUDIT-PARAM <encrypt:0|1> CMD arg1 arg2 ... */
         int encryptEnabled = atoi(c->argv[2]->ptr);
         robj **orig_argv = c->argv;
         int orig_argc = c->argc;
@@ -941,6 +940,19 @@ NULL
         c->argv = orig_argv;
         c->argc = orig_argc;
         addReplyBulkSds(c, param);
+    } else if (!strcasecmp(c->argv[1]->ptr,"audit-entry") &&
+               c->argc >= 3)
+    {
+        robj **orig_argv = c->argv;
+        int orig_argc = c->argc;
+        c->argv = c->argv + 2;
+        c->argc = c->argc - 2;
+        auditLogEntry *entry = auditCreateEntry(c);
+        sds json = auditEntryToJSON(entry);
+        auditFreeEntry(entry);
+        c->argv = orig_argv;
+        c->argc = orig_argc;
+        addReplyBulkSds(c, json);
     } else {
         addReplySubcommandSyntaxError(c);
         return;

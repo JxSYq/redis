@@ -468,3 +468,61 @@ start_server {tags {"audit-log"}} {
         assert_equal "RENAME k *" [r debug audit-param 1 RENAME k k]
     }
 }
+
+start_server {tags {"audit-log"}} {
+    test {DEBUG AUDIT-ENTRY: basic JSON format for SET} {
+        set json [r debug audit-entry SET mykey myvalue]
+        # Verify it is valid JSON-like format with key fields
+        assert_match {*"command_name":"SET"*} $json
+        assert_match {*"command_type":"string"*} $json
+        assert_match {*"command_keys":\["mykey"\]*} $json
+        assert_match {*"db":0*} $json
+        assert_match {*"role":"master"*} $json
+        assert_match {*"extend":""*} $json
+    }
+
+    test {DEBUG AUDIT-ENTRY: includes all required fields} {
+        set json [r debug audit-entry HSET myhash field val]
+        assert_match {*"time":*} $json
+        assert_match {*"instance_id":*} $json
+        assert_match {*"proxy_addr":*} $json
+        assert_match {*"server_addr":*} $json
+        assert_match {*"role":*} $json
+        assert_match {*"client_addr":*} $json
+        assert_match {*"client_type":*} $json
+        assert_match {*"user":*} $json
+        assert_match {*"db":*} $json
+        assert_match {*"command_name":*} $json
+        assert_match {*"command_type":*} $json
+        assert_match {*"command_keys":*} $json
+        assert_match {*"command_param":*} $json
+        assert_match {*"use_time":*} $json
+        assert_match {*"extend":*} $json
+    }
+
+    test {DEBUG AUDIT-ENTRY: multi-key command keys array} {
+        set json [r debug audit-entry DEL k1 k2 k3]
+        assert_match {*"command_keys":\["k1","k2","k3"\]*} $json
+        assert_match {*"command_name":"DEL"*} $json
+        assert_match {*"command_type":"generic"*} $json
+    }
+
+    test {DEBUG AUDIT-ENTRY: JSON string escaping} {
+        set json [r debug audit-entry SET "key\"with\"quotes" "val\\backslash"]
+        assert_match {*"key\\\"with\\\"quotes"*} $json
+        assert_match {*"val\\\\backslash"*} $json
+    }
+
+    test {DEBUG AUDIT-ENTRY: encryption in command_param} {
+        r config set audit-log-encrypt-enabled yes
+        set json [r debug audit-entry SET mykey secret123]
+        # Key "mykey" should be plain, value "secret123" should be masked
+        assert_match {*"command_param":"SET mykey secr*****"*} $json
+        r config set audit-log-encrypt-enabled no
+    }
+
+    test {DEBUG AUDIT-ENTRY: client_type for normal client} {
+        set json [r debug audit-entry PING]
+        assert_match {*"client_type":"0"*} $json
+    }
+}
