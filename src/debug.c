@@ -912,6 +912,22 @@ NULL
             addReplyBulkSds(c, keys[i]);
         }
         zfree(keys); /* keys sds were moved to reply, just free array */
+    } else if (!strcasecmp(c->argv[1]->ptr,"audit-param") &&
+               c->argc >= 5)
+    {
+        /* DEBUG AUDIT-PARAM <encrypt:0|1> CMD arg1 arg2 ... */
+        int encryptEnabled = atoi(c->argv[2]->ptr);
+        robj **orig_argv = c->argv;
+        int orig_argc = c->argc;
+        c->argv = c->argv + 3;
+        c->argc = c->argc - 3;
+        int numkeys = 0;
+        sds *keys = auditExtractKeys(c, &numkeys);
+        sds param = auditBuildCommandParam(c, keys, numkeys, encryptEnabled);
+        auditFreeKeys(keys, numkeys);
+        c->argv = orig_argv;
+        c->argc = orig_argc;
+        addReplyBulkSds(c, param);
     } else {
         addReplySubcommandSyntaxError(c);
         return;
