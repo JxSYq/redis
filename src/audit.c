@@ -2,6 +2,8 @@
 #include "server.h"
 #include <pthread.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 /* Ring buffer queue for asynchronous audit logging */
 typedef struct auditLogQueue {
@@ -18,6 +20,7 @@ typedef struct auditLogQueue {
 static auditLogQueue *audit_queue = NULL;
 static pthread_t audit_log_thread;
 static int audit_thread_running = 0;
+static FILE *audit_log_file = NULL;
 
 /* Thread function prototype */
 static void *auditLogThreadMain(void *arg);
@@ -187,6 +190,89 @@ void auditLogQueueRebuild(int new_capacity) {
 }
 
 /* --------------------------------------------------------------------------
+ * File operations
+ * -------------------------------------------------------------------------- */
+
+/* Open the audit log file in append mode with permissions 0600.
+ * Returns 1 on success, 0 on failure. */
+int auditLogFileOpen(const char *path) {
+    if (!path || path[0] == '\0') return 0;
+
+    FILE *f = fopen(path, "a");
+    if (!f) {
+        serverLog(LL_WARNING,
+            "Audit log: Failed to open file: %s", path);
+        return 0;
+    }
+
+    /* Set file permissions to 0600 (owner read/write only) */
+    int fd = fileno(f);
+    fchmod(fd, S_IRUSR | S_IWUSR);
+
+    audit_log_file = f;
+    return 1;
+}
+
+/* Write a line to the audit log file. */
+void auditLogFileWrite(const char *line, size_t len) {
+    if (audit_log_file == NULL) return;
+    if (fwrite(line, 1, len, audit_log_file) != len) {
+        serverLog(LL_WARNING, "Audit log: Failed to write to log file");
+    }
+    fflush(audit_log_file);
+}
+
+/* Close the current audit log file. */
+void auditLogFileClose(void) {
+    if (audit_log_file) {
+        fclose(audit_log_file);
+        audit_log_file = NULL;
+    }
+}
+
+/* Switch to a new log file path. Closes the old file and opens the new one. */
+void auditLogFileSwitch(const char *newPath) {
+    auditLogFileClose();
+    if (newPath && newPath[0] != '\0') {
+        auditLogFileOpen(newPath);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Configuration update callbacks
+ * -------------------------------------------------------------------------- */
+
+/* Called when audit-log-enabled is changed via CONFIG SET */
+int auditLogEnabledUpdate(int val, int prev, const char **err) {
+    UNUSED(prev);
+    UNUSED(err);
+    if (!val) {
+        /* When disabled, close the file. The consumer thread will
+         * still drain the queue but won't write to file. */
+        auditLogFileClose();
+    }
+    return 1;
+}
+
+/* Called when audit-log-path is changed via CONFIG SET */
+int auditLogPathUpdate(char *val, char *prev, const char **err) {
+    UNUSED(prev);
+    UNUSED(err);
+    auditLogFileSwitch(val);
+    return 1;
+}
+
+/* Called when audit-log-queue-length is changed via CONFIG SET */
+int auditLogQueueLengthUpdate(long long val, long long prev, const char **err) {
+    UNUSED(prev);
+    UNUSED(err);
+    if (val > 0 && val != prev) {
+        auditLogQueueRebuild((int)val);
+    }
+    return 1;
+}
+
+/* --------------------------------------------------------------------------
  * Consumer thread
  * -------------------------------------------------------------------------- */
 
@@ -210,12 +296,12 @@ static void *auditLogThreadMain(void *arg) {
         auditLogQueuePop(&entry);
 
         if (entry == NULL) {
-            /* Should stop and queue is empty */
             break;
         }
 
-        /* Process the entry: just free it for now (Commit 2).
-         * File writing will be added in Commit 3. */
+        if (server.audit_log_enabled) {
+            auditLogFileWrite(entry->raw, sdslen(entry->raw));
+        }
         sdsfree(entry->raw);
         zfree(entry);
     }
@@ -228,6 +314,11 @@ void auditLogThreadStart(void) {
 
     /* Initialize the queue with configured capacity */
     auditLogQueueInit(server.audit_log_queue_length);
+
+    /* Open log file if path is configured */
+    if (server.audit_log_path && server.audit_log_path[0] != '\0') {
+        auditLogFileOpen(server.audit_log_path);
+    }
 
     pthread_attr_t attr;
     pthread_t thread;
