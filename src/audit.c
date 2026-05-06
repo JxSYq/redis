@@ -334,6 +334,14 @@ int auditLogQueueLengthUpdate(long long val, long long prev, const char **err) {
     return 1;
 }
 
+int auditCustomerCommandListUpdate(char *val, char *prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
+    UNUSED(err);
+    auditRebuildCustomerCommandDict();
+    return 1;
+}
+
 /* --------------------------------------------------------------------------
  * Command type mapping
  * -------------------------------------------------------------------------- */
@@ -1069,7 +1077,7 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
  * -------------------------------------------------------------------------- */
 
 /* Get nanosecond-precision Unix timestamp. */
-static long long auditNanoTime(void) {
+long long auditNanoTime(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
@@ -1248,6 +1256,104 @@ void auditFreeEntry(auditLogEntry *entry) {
     sdsfree(entry->extend);
     sdsfree(entry->raw);
     zfree(entry);
+}
+
+/* --------------------------------------------------------------------------
+ * Command filtering and audit trigger
+ * -------------------------------------------------------------------------- */
+
+static dict *audit_customer_command_dict = NULL;
+
+static dictType customerCommandDictType = {
+    dictSdsCaseHash,
+    NULL,
+    NULL,
+    dictSdsKeyCaseCompare,
+    dictSdsDestructor,
+    NULL,
+    NULL
+};
+
+/* Rebuild the customer command dictionary from the config string. */
+void auditRebuildCustomerCommandDict(void) {
+    if (audit_customer_command_dict) {
+        dictRelease(audit_customer_command_dict);
+    }
+    audit_customer_command_dict = dictCreate(&customerCommandDictType, NULL);
+
+    if (!server.audit_log_customer_command_list ||
+        server.audit_log_customer_command_list[0] == '\0')
+        return;
+
+    sds copy = sdsnew(server.audit_log_customer_command_list);
+    int argc;
+    sds *argv = sdssplitargs(copy, &argc);
+    sdsfree(copy);
+
+    if (argv) {
+        for (int i = 0; i < argc; i++) {
+            sds upper = sdsdup(argv[i]);
+            sdstoupper(upper);
+            dictAdd(audit_customer_command_dict, upper, NULL);
+        }
+        sdsfreesplitres(argv, argc);
+    }
+}
+
+/* Check if the command should be audited. */
+int auditShouldLog(client *c) {
+    if (!server.audit_log_enabled) return 0;
+    if (!c->cmd) return 0;
+
+    /* Write commands */
+    if (c->cmd->flags & CMD_WRITE) return 1;
+
+    /* Customer command list */
+    if (audit_customer_command_dict) {
+        sds upper = sdsnew(c->argv[0]->ptr);
+        sdstoupper(upper);
+        dictEntry *de = dictFind(audit_customer_command_dict, upper);
+        sdsfree(upper);
+        if (de) return 1;
+    }
+
+    return 0;
+}
+
+/* Check if the response is an error. Called after command execution. */
+static int auditResponseIsError(client *c) {
+    if (!c->bufpos && listLength(c->reply) == 0) return 0;
+    /* Check if the reply starts with '-' (RESP error prefix) */
+    if (c->bufpos > 0 && c->buf[0] == '-') return 1;
+    /* For reply list, check first element */
+    if (listLength(c->reply) > 0) {
+        listNode *ln = listFirst(c->reply);
+        clientReplyBlock *o = ln->value;
+        if (o->used > 0 && o->buf[0] == '-') return 1;
+    }
+    return 0;
+}
+
+/* Check if the response is empty. */
+static int auditResponseIsEmpty(client *c) {
+    return (c->bufpos == 0 && listLength(c->reply) == 0);
+}
+
+/* Trigger audit logging for a command after execution. */
+void auditLogCommand(client *c) {
+    if (!auditShouldLog(c)) return;
+    if (auditResponseIsError(c)) return;
+    if (auditResponseIsEmpty(c)) return;
+
+    auditLogEntry *entry = auditCreateEntry(c);
+    entry->use_time = (auditNanoTime() - c->audit_start_time) / 1000;
+
+    /* Serialize to JSON before pushing */
+    entry->raw = auditEntryToJSON(entry);
+
+    if (!auditLogQueuePush(entry)) {
+        auditFreeEntry(entry);
+    }
 }
 
 /* --------------------------------------------------------------------------

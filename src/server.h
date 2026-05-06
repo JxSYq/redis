@@ -955,6 +955,8 @@ typedef struct client {
     /* Response buffer */
     int bufpos;
     char buf[PROTO_REPLY_CHUNK_BYTES];
+    /* Audit log */
+    long long audit_start_time; /* Command start time for audit (nanoseconds) */
 } client;
 
 struct saveparam {
