@@ -411,3 +411,67 @@ start_server {tags {"audit-log"}} {
         assert_match {*"client_type":"0"*} $json
     }
 }
+
+start_server {tags {"audit-log"}} {
+    test {Audit: write commands generate log when enabled} {
+        r config set audit-log-enabled yes
+        r config set audit-log-path /tmp/test_audit_write.log
+        r SET audit_write_key audit_write_val
+        after 200
+        set fp [open /tmp/test_audit_write.log r]
+        set content [read $fp]
+        close $fp
+        assert_match {*"command_name":"SET"*} $content
+        assert_match {*"command_keys":\["audit_write_key"\]*} $content
+        file delete /tmp/test_audit_write.log
+    }
+
+    test {Audit: read commands NOT logged by default} {
+        r config set audit-log-path /tmp/test_audit_read.log
+        r GET audit_write_key
+        after 200
+        assert {![file exists /tmp/test_audit_read.log] || [file size /tmp/test_audit_read.log] == 0}
+        file delete /tmp/test_audit_read.log
+    }
+
+    test {Audit: customer command list adds read commands} {
+        r config set audit-log-customer-command-list "GET"
+        r config set audit-log-path /tmp/test_audit_cust.log
+        r GET audit_write_key
+        after 200
+        set fp [open /tmp/test_audit_cust.log r]
+        set content [read $fp]
+        close $fp
+        assert_match {*"command_name":"GET"*} $content
+        file delete /tmp/test_audit_cust.log
+        r config set audit-log-customer-command-list ""
+    }
+
+    test {Audit: failed commands NOT logged} {
+        r config set audit-log-path /tmp/test_audit_fail.log
+        catch {r INCR audit_write_key} err
+        after 200
+        assert {![file exists /tmp/test_audit_fail.log] || [file size /tmp/test_audit_fail.log] == 0}
+        file delete /tmp/test_audit_fail.log
+    }
+
+    test {Audit: disabled stops logging} {
+        r config set audit-log-enabled yes
+        r config set audit-log-path /tmp/test_audit_disable.log
+        r SET audit_key1 val1
+        after 200
+        assert {[file exists /tmp/test_audit_disable.log]}
+        r config set audit-log-enabled no
+        r SET audit_key2 val2
+        after 200
+        set fp [open /tmp/test_audit_disable.log r]
+        set content [read $fp]
+        close $fp
+        # Should only contain audit_key1, not audit_key2
+        assert {[string first "audit_key2" $content] == -1}
+        file delete /tmp/test_audit_disable.log
+    }
+
+    r config set audit-log-enabled no
+    r config set audit-log-path ""
+}

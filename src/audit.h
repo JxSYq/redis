@@ -56,6 +56,7 @@ void auditLogFileSwitch(const char *newPath);
 int auditLogEnabledUpdate(int val, int prev, const char **err);
 int auditLogPathUpdate(char *val, char *prev, const char **err);
 int auditLogQueueLengthUpdate(long long val, long long prev, const char **err);
+int auditCustomerCommandListUpdate(char *val, char *prev, const char **err);
 
 /* Command type mapping */
 void auditCommandTypeInit(void);
@@ -72,5 +73,11 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys, int encryptEnabled
 auditLogEntry *auditCreateEntry(client *c);
 sds auditEntryToJSON(auditLogEntry *entry);
 void auditFreeEntry(auditLogEntry *entry);
+
+/* Command filtering and audit trigger */
+void auditRebuildCustomerCommandDict(void);
+int auditShouldLog(client *c);
+void auditLogCommand(client *c);
+long long auditNanoTime(void);
 
 #endif /* __AUDIT_H */
