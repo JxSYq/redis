@@ -691,6 +691,205 @@ const char *auditGetCommandType(const char *cmdName) {
 }
 
 /* --------------------------------------------------------------------------
+ * Command keys extraction
+ * -------------------------------------------------------------------------- */
+
+/* Number of keys that will be tracked. */
+#define AUDIT_MAX_KEYS 256
+
+/* Is the command a "multi-key" command where all arguments are keys?
+ * Based on the audit design: DEL, EXISTS, UNLINK, TOUCH, MGET, WAIT */
+static int auditIsAllKeysCommand(const char *cmdname) {
+    return !strcasecmp(cmdname, "del") ||
+           !strcasecmp(cmdname, "exists") ||
+           !strcasecmp(cmdname, "unlink") ||
+           !strcasecmp(cmdname, "touch") ||
+           !strcasecmp(cmdname, "mget");
+}
+
+/* Extract keys from command arguments based on audit-specific rules.
+ * Returns an array of SDS key strings and sets *numkeys.
+ * The caller is responsible for freeing each key and the array. */
+sds *auditExtractKeys(client *c, int *numkeys) {
+    sds *keys = NULL;
+    *numkeys = 0;
+
+    if (c->argc <= 1) return NULL;
+
+    const char *cmdname = (const char *)c->argv[0]->ptr;
+    robj **argv = c->argv;
+    int argc = c->argc;
+
+    /* --- Special commands per audit design --- */
+
+    /* MSET/MSETNX: odd positions (1,3,5...) are keys */
+    if (!strcasecmp(cmdname, "mset") || !strcasecmp(cmdname, "msetnx")) {
+        *numkeys = (argc - 1) / 2;
+        if (*numkeys == 0) return NULL;
+        keys = zmalloc(sizeof(sds) * (*numkeys));
+        for (int i = 1, ki = 0; i < argc; i += 2, ki++) {
+            keys[ki] = sdsnew(argv[i]->ptr);
+        }
+        return keys;
+    }
+
+    /* SMOVE, ZRANGESTORE, BLMOVE, LMOVE: first two args are keys */
+    if (!strcasecmp(cmdname, "smove") ||
+        !strcasecmp(cmdname, "zrangestore") ||
+        !strcasecmp(cmdname, "blmove") ||
+        !strcasecmp(cmdname, "lmove")) {
+        if (argc < 3) return NULL;
+        *numkeys = 2;
+        keys = zmalloc(sizeof(sds) * 2);
+        keys[0] = sdsnew(argv[1]->ptr);
+        keys[1] = sdsnew(argv[2]->ptr);
+        return keys;
+    }
+
+    /* ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE: destkey + numkeys-based keys
+     * Format: CMD destkey numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] */
+    if (!strcasecmp(cmdname, "zunionstore") ||
+        !strcasecmp(cmdname, "zinterstore") ||
+        !strcasecmp(cmdname, "zdiffstore")) {
+        if (argc < 4) return NULL;
+        long nkeys;
+        if (!string2l(argv[2]->ptr, sdslen(argv[2]->ptr), &nkeys))
+            return NULL;
+        if (nkeys <= 0 || nkeys > (argc - 3)) return NULL;
+        *numkeys = (int)nkeys + 1; /* +1 for destkey */
+        keys = zmalloc(sizeof(sds) * (*numkeys));
+        keys[0] = sdsnew(argv[1]->ptr); /* destkey */
+        for (int i = 0; i < (int)nkeys; i++) {
+            keys[i + 1] = sdsnew(argv[3 + i]->ptr);
+        }
+        return keys;
+    }
+
+    /* ZDIFF/ZUNION/ZINTER: numkeys-based keys
+     * Format: CMD numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...]
+     * Note: ZDIFF/ZUNION/ZINTER have no destkey */
+    if (!strcasecmp(cmdname, "zdiff") ||
+        !strcasecmp(cmdname, "zunion") ||
+        !strcasecmp(cmdname, "zinter")) {
+        if (argc < 3) return NULL;
+        long nkeys;
+        if (!string2l(argv[1]->ptr, sdslen(argv[1]->ptr), &nkeys))
+            return NULL;
+        if (nkeys <= 0 || nkeys > (argc - 2)) return NULL;
+        *numkeys = (int)nkeys;
+        keys = zmalloc(sizeof(sds) * (*numkeys));
+        for (int i = 0; i < (int)nkeys; i++) {
+            keys[i] = sdsnew(argv[2 + i]->ptr);
+        }
+        return keys;
+    }
+
+    /* BITOP: operation is arg[1], keys start from arg[2] */
+    if (!strcasecmp(cmdname, "bitop")) {
+        if (argc < 4) return NULL;
+        *numkeys = argc - 2;
+        keys = zmalloc(sizeof(sds) * (*numkeys));
+        for (int i = 2, ki = 0; i < argc; i++, ki++) {
+            keys[ki] = sdsnew(argv[i]->ptr);
+        }
+        return keys;
+    }
+
+    /* SORT: first arg is key */
+    if (!strcasecmp(cmdname, "sort")) {
+        *numkeys = 1;
+        keys = zmalloc(sizeof(sds));
+        keys[0] = sdsnew(argv[1]->ptr);
+        return keys;
+    }
+
+    /* SORT_RO: first arg is key (same as SORT) */
+    if (!strcasecmp(cmdname, "sort_ro")) {
+        *numkeys = 1;
+        keys = zmalloc(sizeof(sds));
+        keys[0] = sdsnew(argv[1]->ptr);
+        return keys;
+    }
+
+    /* BLPOP/BRPOP: all args except the last one (timeout) are keys */
+    if (!strcasecmp(cmdname, "blpop") || !strcasecmp(cmdname, "brpop")) {
+        *numkeys = argc - 2; /* minus cmd name and timeout */
+        if (*numkeys <= 0) return NULL;
+        keys = zmalloc(sizeof(sds) * (*numkeys));
+        for (int i = 1, ki = 0; i < argc - 1; i++, ki++) {
+            keys[ki] = sdsnew(argv[i]->ptr);
+        }
+        return keys;
+    }
+
+    /* BRPOPLPUSH: first two args are keys */
+    if (!strcasecmp(cmdname, "brpoplpush")) {
+        if (argc < 3) return NULL;
+        *numkeys = 2;
+        keys = zmalloc(sizeof(sds) * 2);
+        keys[0] = sdsnew(argv[1]->ptr);
+        keys[1] = sdsnew(argv[2]->ptr);
+        return keys;
+    }
+
+    /* XREAD/XREADGROUP: keys after STREAMS keyword
+     * Format: XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
+     * Format: XREADGROUP GROUP group consumer [...] STREAMS key [key ...] id [id ...] */
+    if (!strcasecmp(cmdname, "xread") || !strcasecmp(cmdname, "xreadgroup")) {
+        /* Find STREAMS keyword position */
+        int streams_pos = -1;
+        for (int i = 1; i < argc; i++) {
+            if (!strcasecmp(argv[i]->ptr, "streams")) {
+                streams_pos = i;
+                break;
+            }
+        }
+        if (streams_pos < 0 || streams_pos + 1 >= argc) return NULL;
+
+        /* Keys are between STREAMS and IDs.
+         * IDs start at position: (argc + streams_pos + 1) / 2
+         * Actually: keys = argv[streams_pos+1 .. (streams_pos + 1 + (argc - streams_pos - 1) / 2) - 1]
+         * The IDs are the second half of arguments after STREAMS */
+        int remaining = argc - streams_pos - 1;
+        *numkeys = remaining / 2;
+        if (*numkeys <= 0) return NULL;
+        keys = zmalloc(sizeof(sds) * (*numkeys));
+        for (int i = 0; i < *numkeys; i++) {
+            keys[i] = sdsnew(argv[streams_pos + 1 + i]->ptr);
+        }
+        return keys;
+    }
+
+    /* --- Default rules --- */
+
+    /* Multi-key commands: all args are keys */
+    if (auditIsAllKeysCommand(cmdname)) {
+        if (argc < 2) return NULL;
+        *numkeys = argc - 1;
+        keys = zmalloc(sizeof(sds) * (*numkeys));
+        for (int i = 1; i < argc; i++) {
+            keys[i - 1] = sdsnew(argv[i]->ptr);
+        }
+        return keys;
+    }
+
+    /* Default: single key command, first argument is the key */
+    *numkeys = 1;
+    keys = zmalloc(sizeof(sds));
+    keys[0] = sdsnew(argv[1]->ptr);
+    return keys;
+}
+
+/* Free keys array returned by auditExtractKeys */
+void auditFreeKeys(sds *keys, int numkeys) {
+    if (keys == NULL) return;
+    for (int i = 0; i < numkeys; i++) {
+        sdsfree(keys[i]);
+    }
+    zfree(keys);
+}
+
+/* --------------------------------------------------------------------------
  * Consumer thread
  * -------------------------------------------------------------------------- */
 
