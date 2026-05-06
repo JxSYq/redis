@@ -887,6 +887,14 @@ NULL
         mallctl_string(c, c->argv+2, c->argc-2);
         return;
 #endif
+    } else if (!strcasecmp(c->argv[1]->ptr,"pause-cron") && c->argc == 3) {
+        server.pause_cron = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"audit-type") &&
+               c->argc == 3)
+    {
+        const char *type = auditGetCommandType(c->argv[2]->ptr);
+        addReplyBulkCString(c, type);
     } else {
         addReplySubcommandSyntaxError(c);
         return;
