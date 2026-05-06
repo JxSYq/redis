@@ -3374,6 +3374,7 @@ void initServer(void) {
     slowlogInit();
     latencyMonitorInit();
     auditCommandTypeInit();
+    auditRebuildCustomerCommandDict();
 
     /* Initialize ACL default password if it exists */
     ACLUpdateDefaultUserPassword(server.requirepass);
@@ -3743,6 +3744,7 @@ void call(client *c, int flags) {
         monotonic_start = getMonotonicUs();
 
     server.in_nested_call++;
+    c->audit_start_time = auditNanoTime();
     c->cmd->proc(c);
     server.in_nested_call--;
 
@@ -3932,6 +3934,9 @@ void call(client *c, int flags) {
     size_t zmalloc_used = zmalloc_used_memory();
     if (zmalloc_used > server.stat_peak_memory)
         server.stat_peak_memory = zmalloc_used;
+
+    /* Audit log */
+    auditLogCommand(c);
 
     /* Do some maintenance job and cleanup */
     afterCommand(c);
