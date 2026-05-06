@@ -26,4 +26,15 @@ void auditLogQueueRebuild(int new_capacity);
 /* File utility: create parent directories for a file path */
 int auditEnsureDir(const char *filepath);
 
+/* File operations */
+int  auditLogFileOpen(const char *path);
+void auditLogFileWrite(const char *line, size_t len);
+void auditLogFileClose(void);
+void auditLogFileSwitch(const char *newPath);
+
+/* Configuration update callbacks */
+int auditLogEnabledUpdate(int val, int prev, const char **err);
+int auditLogPathUpdate(char *val, char *prev, const char **err);
+int auditLogQueueLengthUpdate(long long val, long long prev, const char **err);
+
 #endif /* __AUDIT_H */
