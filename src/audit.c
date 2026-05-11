@@ -192,10 +192,40 @@ void auditLogQueueRebuild(int new_capacity) {
  * File operations
  * -------------------------------------------------------------------------- */
 
+/* Recursively create directories for the given file path.
+ * dirpath should be a mutable buffer large enough to hold the path. */
+static void auditCreateParentDir(char *dirpath) {
+    size_t len = strlen(dirpath);
+    if (len == 0) return;
+
+    /* Remove trailing slash if present */
+    while (len > 0 && dirpath[len - 1] == '/') {
+        dirpath[--len] = '\0';
+    }
+
+    for (size_t i = (dirpath[0] == '/') ? 1 : 0; i < len; i++) {
+        if (dirpath[i] == '/') {
+            dirpath[i] = '\0';
+            mkdir(dirpath, 0755);
+            dirpath[i] = '/';
+        }
+    }
+    mkdir(dirpath, 0755);
+}
+
 /* Open the audit log file in append mode with permissions 0600.
+ * Creates parent directories if they don't exist.
  * Returns 1 on success, 0 on failure. */
 int auditLogFileOpen(const char *path) {
     if (!path || path[0] == '\0') return 0;
+
+    /* Ensure parent directory exists */
+    char *path_copy = zstrdup(path);
+    char *last_slash = strrchr(path_copy, '/');
+    if (last_slash) {
+        auditCreateParentDir(path_copy);
+    }
+    zfree(path_copy);
 
     FILE *f = fopen(path, "a");
     if (!f) {
