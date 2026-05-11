@@ -788,7 +788,7 @@ sds *auditExtractKeys(client *c, int *numkeys) {
     /* MSET/MSETNX: odd positions (1,3,5...) are keys */
     if (!strcasecmp(cmdname, "mset") || !strcasecmp(cmdname, "msetnx")) {
         *numkeys = (argc - 1) / 2;
-        if (*numkeys == 0) return NULL;
+        if (*numkeys <= 0 || *numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
         for (int i = 1, ki = 0; i < argc; i += 2, ki++) {
             keys[ki] = sdsnew(argv[i]->ptr);
@@ -820,6 +820,7 @@ sds *auditExtractKeys(client *c, int *numkeys) {
             return NULL;
         if (nkeys <= 0 || nkeys > (argc - 3)) return NULL;
         *numkeys = (int)nkeys + 1; /* +1 for destkey */
+        if (*numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
         keys[0] = sdsnew(argv[1]->ptr); /* destkey */
         for (int i = 0; i < (int)nkeys; i++) {
@@ -840,6 +841,7 @@ sds *auditExtractKeys(client *c, int *numkeys) {
             return NULL;
         if (nkeys <= 0 || nkeys > (argc - 2)) return NULL;
         *numkeys = (int)nkeys;
+        if (*numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
         for (int i = 0; i < (int)nkeys; i++) {
             keys[i] = sdsnew(argv[2 + i]->ptr);
@@ -851,6 +853,7 @@ sds *auditExtractKeys(client *c, int *numkeys) {
     if (!strcasecmp(cmdname, "bitop")) {
         if (argc < 4) return NULL;
         *numkeys = argc - 2;
+        if (*numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
         for (int i = 2, ki = 0; i < argc; i++, ki++) {
             keys[ki] = sdsnew(argv[i]->ptr);
@@ -858,16 +861,8 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         return keys;
     }
 
-    /* SORT: first arg is key */
-    if (!strcasecmp(cmdname, "sort")) {
-        *numkeys = 1;
-        keys = zmalloc(sizeof(sds));
-        keys[0] = sdsnew(argv[1]->ptr);
-        return keys;
-    }
-
-    /* SORT_RO: first arg is key (same as SORT) */
-    if (!strcasecmp(cmdname, "sort_ro")) {
+    /* SORT/SORT_RO: first arg is key */
+    if (!strcasecmp(cmdname, "sort") || !strcasecmp(cmdname, "sort_ro")) {
         *numkeys = 1;
         keys = zmalloc(sizeof(sds));
         keys[0] = sdsnew(argv[1]->ptr);
@@ -877,7 +872,7 @@ sds *auditExtractKeys(client *c, int *numkeys) {
     /* BLPOP/BRPOP: all args except the last one (timeout) are keys */
     if (!strcasecmp(cmdname, "blpop") || !strcasecmp(cmdname, "brpop")) {
         *numkeys = argc - 2; /* minus cmd name and timeout */
-        if (*numkeys <= 0) return NULL;
+        if (*numkeys <= 0 || *numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
         for (int i = 1, ki = 0; i < argc - 1; i++, ki++) {
             keys[ki] = sdsnew(argv[i]->ptr);
@@ -915,7 +910,7 @@ sds *auditExtractKeys(client *c, int *numkeys) {
          * The IDs are the second half of arguments after STREAMS */
         int remaining = argc - streams_pos - 1;
         *numkeys = remaining / 2;
-        if (*numkeys <= 0) return NULL;
+        if (*numkeys <= 0 || *numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
         for (int i = 0; i < *numkeys; i++) {
             keys[i] = sdsnew(argv[streams_pos + 1 + i]->ptr);
@@ -929,6 +924,7 @@ sds *auditExtractKeys(client *c, int *numkeys) {
     if (auditIsAllKeysCommand(cmdname)) {
         if (argc < 2) return NULL;
         *numkeys = argc - 1;
+        if (*numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
         for (int i = 1; i < argc; i++) {
             keys[i - 1] = sdsnew(argv[i]->ptr);
