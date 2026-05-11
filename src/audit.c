@@ -22,6 +22,7 @@ static auditLogQueue *audit_queue = NULL;
 static pthread_t audit_log_thread;
 static int audit_thread_running = 0;
 static FILE *audit_log_file = NULL;
+static pthread_mutex_t audit_file_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Thread function prototype */
 static void *auditLogThreadMain(void *arg);
@@ -255,25 +256,36 @@ int auditLogFileOpen(const char *path) {
     int fd = fileno(f);
     fchmod(fd, S_IRUSR | S_IWUSR);
 
+    pthread_mutex_lock(&audit_file_lock);
+    FILE *old = audit_log_file;
     audit_log_file = f;
+    pthread_mutex_unlock(&audit_file_lock);
+
+    /* Close any previously opened file outside the lock */
+    if (old) fclose(old);
     return 1;
 }
 
 /* Write a line to the audit log file. */
 void auditLogFileWrite(const char *line, size_t len) {
-    if (audit_log_file == NULL) return;
-    if (fwrite(line, 1, len, audit_log_file) != len) {
-        serverLog(LL_WARNING, "Audit log: Failed to write to log file");
+    pthread_mutex_lock(&audit_file_lock);
+    FILE *f = audit_log_file;
+    if (f) {
+        if (fwrite(line, 1, len, f) != len) {
+            serverLog(LL_WARNING, "Audit log: Failed to write to log file");
+        }
+        fflush(f);
     }
-    fflush(audit_log_file);
+    pthread_mutex_unlock(&audit_file_lock);
 }
 
 /* Close the current audit log file. */
 void auditLogFileClose(void) {
-    if (audit_log_file) {
-        fclose(audit_log_file);
-        audit_log_file = NULL;
-    }
+    pthread_mutex_lock(&audit_file_lock);
+    FILE *f = audit_log_file;
+    audit_log_file = NULL;
+    pthread_mutex_unlock(&audit_file_lock);
+    if (f) fclose(f);
 }
 
 /* Switch to a new log file path. Closes the old file and opens the new one. */
@@ -292,7 +304,12 @@ void auditLogFileSwitch(const char *newPath) {
 int auditLogEnabledUpdate(int val, int prev, const char **err) {
     UNUSED(prev);
     UNUSED(err);
-    if (!val) {
+    if (val) {
+        /* When enabled, re-open the log file if a path is configured */
+        if (server.audit_log_path && server.audit_log_path[0] != '\0') {
+            auditLogFileOpen(server.audit_log_path);
+        }
+    } else {
         /* When disabled, close the file. The consumer thread will
          * still drain the queue but won't write to file. */
         auditLogFileClose();
@@ -398,6 +415,9 @@ void auditLogThreadStop(void) {
     /* Wait for thread to finish (drain remaining items) */
     pthread_join(audit_log_thread, NULL);
     audit_thread_running = 0;
+
+    /* Close the log file after the consumer has stopped */
+    auditLogFileClose();
 
     /* Clean up the queue */
     auditLogQueueDestroy();
