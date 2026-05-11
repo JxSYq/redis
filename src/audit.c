@@ -2,6 +2,8 @@
 #include "server.h"
 #include <pthread.h>
 #include <signal.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 /* Ring buffer queue for asynchronous audit logging */
 typedef struct auditLogQueue {
@@ -187,6 +189,44 @@ void auditLogQueueRebuild(int new_capacity) {
     audit_queue->count = new_count;
 
     pthread_mutex_unlock(&audit_queue->lock);
+}
+
+/* --------------------------------------------------------------------------
+ * File utility
+ * -------------------------------------------------------------------------- */
+
+/* Recursively create all parent directories needed for the given file path.
+ * Returns 0 on success, -1 on failure. Does not fail if directories already
+ * exist. Directory permissions are 0755 (subject to umask). */
+int auditEnsureDir(const char *filepath) {
+    if (filepath == NULL || *filepath == '\0') return -1;
+
+    char *path = zstrdup(filepath);
+    int ret = 0;
+
+    /* Walk the path, creating each directory level. Skip the root '/'. */
+    for (char *p = (path[0] == '/') ? path + 1 : path; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (path[0] != '\0') {
+                struct stat st;
+                if (stat(path, &st) == -1) {
+                    if (mkdir(path, 0755) == -1 && errno != EEXIST) {
+                        ret = -1;
+                        goto cleanup;
+                    }
+                } else if (!S_ISDIR(st.st_mode)) {
+                    ret = -1;
+                    goto cleanup;
+                }
+            }
+            *p = '/';
+        }
+    }
+
+cleanup:
+    zfree(path);
+    return ret;
 }
 
 /* --------------------------------------------------------------------------

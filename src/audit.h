@@ -23,4 +23,7 @@ void auditLogThreadStop(void);
 /* Queue rebuild for capacity change */
 void auditLogQueueRebuild(int new_capacity);
 
+/* File utility: create parent directories for a file path */
+int auditEnsureDir(const char *filepath);
+
 #endif /* __AUDIT_H */
