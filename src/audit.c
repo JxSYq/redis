@@ -32,9 +32,11 @@ static void *auditLogThreadMain(void *arg);
  * -------------------------------------------------------------------------- */
 
 /* Initialize the queue with a given capacity. Must be called before
- * any other queue operation. */
+ * any other queue operation. Enforces a minimum capacity of 1 to
+ * prevent undefined behavior from zero-capacity ring buffer. */
 void auditLogQueueInit(int capacity) {
     if (audit_queue != NULL) return;
+    if (capacity < 1) capacity = 1;
 
     audit_queue = zmalloc(sizeof(auditLogQueue));
     audit_queue->entries = zcalloc(sizeof(auditLogEntry*) * capacity);
@@ -47,9 +49,10 @@ void auditLogQueueInit(int capacity) {
     pthread_cond_init(&audit_queue->cond, NULL);
 }
 
-/* Non-blocking push. Returns 1 on success, 0 if the queue is full. */
+/* Non-blocking push. Returns 1 on success, 0 if the queue is full.
+ * The caller retains ownership of the entry on failure (must free it). */
 int auditLogQueuePush(auditLogEntry *entry) {
-    if (audit_queue == NULL) return 0;
+    if (audit_queue == NULL || entry == NULL) return 0;
 
     pthread_mutex_lock(&audit_queue->lock);
 
@@ -154,7 +157,7 @@ void auditLogQueueRebuild(int new_capacity) {
 
     for (int i = 0; i < entries_to_copy; i++) {
         int old_idx = (audit_queue->head + i) % audit_queue->capacity;
-        /* Keep oldest entries if we need to drop */
+        /* When shrinking, skip the oldest (dropped) entries */
         if (audit_queue->count > new_capacity) {
             old_idx = (audit_queue->head + (audit_queue->count - new_capacity) + i) % audit_queue->capacity;
         }
