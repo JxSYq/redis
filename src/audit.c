@@ -772,10 +772,12 @@ static int auditIsAllKeysCommand(const char *cmdname) {
 
 /* Extract keys from command arguments based on audit-specific rules.
  * Returns an array of SDS key strings and sets *numkeys.
- * The caller is responsible for freeing each key and the array. */
-sds *auditExtractKeys(client *c, int *numkeys) {
+ * Also sets *key_positions to the argv indices of each key (0-based).
+ * The caller is responsible for freeing each key, positions, and the arrays. */
+sds *auditExtractKeys(client *c, int *numkeys, int **key_positions) {
     sds *keys = NULL;
     *numkeys = 0;
+    *key_positions = NULL;
 
     if (c->argc <= 1) return NULL;
 
@@ -790,8 +792,10 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         *numkeys = (argc - 1) / 2;
         if (*numkeys <= 0 || *numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
+        *key_positions = zmalloc(sizeof(int) * (*numkeys));
         for (int i = 1, ki = 0; i < argc; i += 2, ki++) {
             keys[ki] = sdsnew(argv[i]->ptr);
+            (*key_positions)[ki] = i;
         }
         return keys;
     }
@@ -804,8 +808,11 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         if (argc < 3) return NULL;
         *numkeys = 2;
         keys = zmalloc(sizeof(sds) * 2);
+        *key_positions = zmalloc(sizeof(int) * 2);
         keys[0] = sdsnew(argv[1]->ptr);
         keys[1] = sdsnew(argv[2]->ptr);
+        (*key_positions)[0] = 1;
+        (*key_positions)[1] = 2;
         return keys;
     }
 
@@ -822,9 +829,12 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         *numkeys = (int)nkeys + 1; /* +1 for destkey */
         if (*numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
+        *key_positions = zmalloc(sizeof(int) * (*numkeys));
         keys[0] = sdsnew(argv[1]->ptr); /* destkey */
+        (*key_positions)[0] = 1;
         for (int i = 0; i < (int)nkeys; i++) {
             keys[i + 1] = sdsnew(argv[3 + i]->ptr);
+            (*key_positions)[i + 1] = 3 + i;
         }
         return keys;
     }
@@ -843,8 +853,10 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         *numkeys = (int)nkeys;
         if (*numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
+        *key_positions = zmalloc(sizeof(int) * (*numkeys));
         for (int i = 0; i < (int)nkeys; i++) {
             keys[i] = sdsnew(argv[2 + i]->ptr);
+            (*key_positions)[i] = 2 + i;
         }
         return keys;
     }
@@ -855,8 +867,10 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         *numkeys = argc - 2;
         if (*numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
+        *key_positions = zmalloc(sizeof(int) * (*numkeys));
         for (int i = 2, ki = 0; i < argc; i++, ki++) {
             keys[ki] = sdsnew(argv[i]->ptr);
+            (*key_positions)[ki] = i;
         }
         return keys;
     }
@@ -865,7 +879,9 @@ sds *auditExtractKeys(client *c, int *numkeys) {
     if (!strcasecmp(cmdname, "sort") || !strcasecmp(cmdname, "sort_ro")) {
         *numkeys = 1;
         keys = zmalloc(sizeof(sds));
+        *key_positions = zmalloc(sizeof(int));
         keys[0] = sdsnew(argv[1]->ptr);
+        (*key_positions)[0] = 1;
         return keys;
     }
 
@@ -874,8 +890,10 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         *numkeys = argc - 2; /* minus cmd name and timeout */
         if (*numkeys <= 0 || *numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
+        *key_positions = zmalloc(sizeof(int) * (*numkeys));
         for (int i = 1, ki = 0; i < argc - 1; i++, ki++) {
             keys[ki] = sdsnew(argv[i]->ptr);
+            (*key_positions)[ki] = i;
         }
         return keys;
     }
@@ -885,8 +903,11 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         if (argc < 3) return NULL;
         *numkeys = 2;
         keys = zmalloc(sizeof(sds) * 2);
+        *key_positions = zmalloc(sizeof(int) * 2);
         keys[0] = sdsnew(argv[1]->ptr);
         keys[1] = sdsnew(argv[2]->ptr);
+        (*key_positions)[0] = 1;
+        (*key_positions)[1] = 2;
         return keys;
     }
 
@@ -912,8 +933,10 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         *numkeys = remaining / 2;
         if (*numkeys <= 0 || *numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
+        *key_positions = zmalloc(sizeof(int) * (*numkeys));
         for (int i = 0; i < *numkeys; i++) {
             keys[i] = sdsnew(argv[streams_pos + 1 + i]->ptr);
+            (*key_positions)[i] = streams_pos + 1 + i;
         }
         return keys;
     }
@@ -926,8 +949,10 @@ sds *auditExtractKeys(client *c, int *numkeys) {
         *numkeys = argc - 1;
         if (*numkeys > AUDIT_MAX_KEYS) return NULL;
         keys = zmalloc(sizeof(sds) * (*numkeys));
+        *key_positions = zmalloc(sizeof(int) * (*numkeys));
         for (int i = 1; i < argc; i++) {
             keys[i - 1] = sdsnew(argv[i]->ptr);
+            (*key_positions)[i - 1] = i;
         }
         return keys;
     }
@@ -935,17 +960,20 @@ sds *auditExtractKeys(client *c, int *numkeys) {
     /* Default: single key command, first argument is the key */
     *numkeys = 1;
     keys = zmalloc(sizeof(sds));
+    *key_positions = zmalloc(sizeof(int));
     keys[0] = sdsnew(argv[1]->ptr);
+    (*key_positions)[0] = 1;
     return keys;
 }
 
-/* Free keys array returned by auditExtractKeys */
-void auditFreeKeys(sds *keys, int numkeys) {
+/* Free keys array and positions returned by auditExtractKeys */
+void auditFreeKeys(sds *keys, int numkeys, int *key_positions) {
     if (keys == NULL) return;
     for (int i = 0; i < numkeys; i++) {
         sdsfree(keys[i]);
     }
     zfree(keys);
+    zfree(key_positions);
 }
 
 /* --------------------------------------------------------------------------
@@ -955,24 +983,21 @@ void auditFreeKeys(sds *keys, int numkeys) {
 #define AUDIT_PARAM_MAX_LENGTH 1024
 
 /* Check if the argument at position 'argidx' (0-based in c->argv)
- * is one of the extracted keys. Uses positional matching. */
-static int auditArgIsKey(sds *keys, int numkeys, const char *arg,
-                         int *key_matched)
-{
+ * is a key position, using the key_positions array from auditExtractKeys. */
+static int auditArgIsKeyByPosition(int *key_positions, int numkeys, int argidx) {
     for (int k = 0; k < numkeys; k++) {
-        if (!key_matched[k] && !strcmp(arg, keys[k])) {
-            key_matched[k] = 1;
-            return 1;
-        }
+        if (key_positions[k] == argidx) return 1;
     }
     return 0;
 }
 
 /* Build the CommandParam string: command name + space-separated arguments.
- * Applies truncation and value encryption (masking) as configured. */
+ * Applies truncation and value encryption (masking) as configured.
+ * Uses positional key matching via key_positions array. */
 sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
-                           int encryptEnabled)
+                           int *key_positions, int encryptEnabled)
 {
+    UNUSED(keys);
     if (c->argc == 0) return sdsempty();
 
     /* Per-param max length = 1024 / (argc - 1), command name not in denominator */
@@ -982,17 +1007,14 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
 
     sds result = sdsnew(c->argv[0]->ptr); /* command name */
 
-    /* Track which key entries have been matched (positional matching) */
-    int *key_matched = (numkeys > 0) ? zcalloc(sizeof(int) * numkeys) : NULL;
-
     for (int i = 1; i < c->argc; i++) {
         result = sdscatlen(result, " ", 1);
 
         const char *arg = c->argv[i]->ptr;
         size_t arglen = sdslen(c->argv[i]->ptr);
 
-        int is_key = numkeys > 0 ?
-            auditArgIsKey(keys, numkeys, arg, key_matched) : 0;
+        int is_key = (numkeys > 0 && key_positions != NULL) ?
+            auditArgIsKeyByPosition(key_positions, numkeys, i) : 0;
 
         if (arglen <= (size_t)max_per_arg) {
             /* No truncation needed */
@@ -1040,7 +1062,6 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
         }
     }
 
-    zfree(key_matched);
     return result;
 }
 

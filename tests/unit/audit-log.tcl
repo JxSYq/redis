@@ -456,4 +456,15 @@ start_server {tags {"audit-log"}} {
     test {DEBUG AUDIT-PARAM: BLPOP with encryption} {
         assert_equal "BLPOP k1 k2 *" [r debug audit-param 1 BLPOP k1 k2 5]
     }
+
+    test {DEBUG AUDIT-PARAM: value equals key name is still encrypted} {
+        # "samekey" at position 2 is a value, not a key — must be masked
+        assert_equal "SET samekey sam****" [r debug audit-param 1 SET samekey samekey]
+    }
+
+    test {DEBUG AUDIT-PARAM: duplicate key names handled correctly} {
+        # RENAME k k: only first arg is a key (default single-key rule),
+        # second 'k' is treated as value and gets masked to '*'
+        assert_equal "RENAME k *" [r debug audit-param 1 RENAME k k]
+    }
 }

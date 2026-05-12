@@ -913,13 +913,15 @@ NULL
         c->argv = c->argv + 2;
         c->argc = c->argc - 2;
         int numkeys = 0;
-        sds *keys = auditExtractKeys(c, &numkeys);
+        int *key_positions = NULL;
+        sds *keys = auditExtractKeys(c, &numkeys, &key_positions);
         c->argv = orig_argv;
         c->argc = orig_argc;
         addReplyArrayLen(c, numkeys);
         for (int i = 0; i < numkeys; i++) {
             addReplyBulkSds(c, keys[i]);
         }
+        zfree(key_positions);
         zfree(keys); /* keys sds were moved to reply, just free array */
     } else if (!strcasecmp(c->argv[1]->ptr,"audit-param") &&
                c->argc >= 5)
@@ -931,9 +933,11 @@ NULL
         c->argv = c->argv + 3;
         c->argc = c->argc - 3;
         int numkeys = 0;
-        sds *keys = auditExtractKeys(c, &numkeys);
-        sds param = auditBuildCommandParam(c, keys, numkeys, encryptEnabled);
-        auditFreeKeys(keys, numkeys);
+        int *key_positions = NULL;
+        sds *keys = auditExtractKeys(c, &numkeys, &key_positions);
+        sds param = auditBuildCommandParam(c, keys, numkeys,
+                                           key_positions, encryptEnabled);
+        auditFreeKeys(keys, numkeys, key_positions);
         c->argv = orig_argv;
         c->argc = orig_argc;
         addReplyBulkSds(c, param);
