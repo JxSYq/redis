@@ -1,0 +1,29 @@
+From ba0d8c4ea14918cdaa4a1b64ce6d5c9665eda3ae Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Mon, 11 May 2026 17:59:01 +0800
+Subject: [PATCH 03/20] fix: add audit-log-abort-count to CONFIG sanity skip
+ list
+
+The CONFIG sanity test in introspection.tcl iterates all configs
+and tries CONFIG SET on each. Since audit-log-abort-count is
+IMMUTABLE_CONFIG, it must be in the skip_configs list to avoid
+'ERR Unsupported CONFIG parameter' failure.
+---
+ tests/unit/introspection.tcl | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tests/unit/introspection.tcl b/tests/unit/introspection.tcl
+index b1319211e..0494d400c 100644
+--- a/tests/unit/introspection.tcl
++++ b/tests/unit/introspection.tcl
+@@ -198,6 +198,7 @@ start_server {tags {"introspection"}} {
+             aof_rewrite_cpulist
+             bgsave_cpulist
+             set-proc-title
++            audit-log-abort-count
+         }
+ 
+         if {!$::tls} {
+-- 
+2.43.0
+

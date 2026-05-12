@@ -1,0 +1,59 @@
+From b5f71e1a8c95e078c07302fd82c8c179624f3e03 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Mon, 11 May 2026 19:39:35 +0800
+Subject: [PATCH 05/20] fix: audit queue review - zero capacity guard, NULL
+ entry check, comment
+
+- auditLogQueueInit: enforce minimum capacity of 1 to prevent
+  modulo-by-zero UB and infinite consumer thread wait when
+  audit-log-queue-length is set to 0
+- auditLogQueuePush: add NULL entry guard to prevent consumer
+  thread crash from sdsfree(NULL)
+- auditLogQueueRebuild: fix misleading comment (code keeps
+  newest entries, not oldest, when shrinking)
+---
+ src/audit.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/audit.c b/src/audit.c
+index 85db05e22..7e38f4a7a 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -32,9 +32,11 @@ static void *auditLogThreadMain(void *arg);
+  * -------------------------------------------------------------------------- */
+ 
+ /* Initialize the queue with a given capacity. Must be called before
+- * any other queue operation. */
++ * any other queue operation. Enforces a minimum capacity of 1 to
++ * prevent undefined behavior from zero-capacity ring buffer. */
+ void auditLogQueueInit(int capacity) {
+     if (audit_queue != NULL) return;
++    if (capacity < 1) capacity = 1;
+ 
+     audit_queue = zmalloc(sizeof(auditLogQueue));
+     audit_queue->entries = zcalloc(sizeof(auditLogEntry*) * capacity);
+@@ -47,9 +49,10 @@ void auditLogQueueInit(int capacity) {
+     pthread_cond_init(&audit_queue->cond, NULL);
+ }
+ 
+-/* Non-blocking push. Returns 1 on success, 0 if the queue is full. */
++/* Non-blocking push. Returns 1 on success, 0 if the queue is full.
++ * The caller retains ownership of the entry on failure (must free it). */
+ int auditLogQueuePush(auditLogEntry *entry) {
+-    if (audit_queue == NULL) return 0;
++    if (audit_queue == NULL || entry == NULL) return 0;
+ 
+     pthread_mutex_lock(&audit_queue->lock);
+ 
+@@ -154,7 +157,7 @@ void auditLogQueueRebuild(int new_capacity) {
+ 
+     for (int i = 0; i < entries_to_copy; i++) {
+         int old_idx = (audit_queue->head + i) % audit_queue->capacity;
+-        /* Keep oldest entries if we need to drop */
++        /* When shrinking, skip the oldest (dropped) entries */
+         if (audit_queue->count > new_capacity) {
+             old_idx = (audit_queue->head + (audit_queue->count - new_capacity) + i) % audit_queue->capacity;
+         }
+-- 
+2.43.0
+

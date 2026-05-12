@@ -1,0 +1,27 @@
+From 55e9d3faf61d51ca6d38751f6fc675d1e0f26ebf Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Mon, 11 May 2026 17:55:26 +0800
+Subject: [PATCH 02/20] fix: register audit-log test in all_tests list
+
+The audit-log.tcl test file was placed in tests/unit/ but was not
+added to the ::all_tests list in test_helper.tcl, causing 'runtest'
+to fail with 'couldn't read file tests/audit-log.tcl'.
+---
+ tests/test_helper.tcl | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tests/test_helper.tcl b/tests/test_helper.tcl
+index 5a4cbd49f..09c10e472 100644
+--- a/tests/test_helper.tcl
++++ b/tests/test_helper.tcl
+@@ -78,6 +78,7 @@ set ::all_tests {
+     unit/shutdown
+     unit/networking
+     unit/cluster
++    unit/audit-log
+ }
+ # Index to the next test to run in the ::all_tests list.
+ set ::next_test 0
+-- 
+2.43.0
+

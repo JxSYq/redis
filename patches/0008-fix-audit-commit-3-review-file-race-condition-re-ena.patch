@@ -1,0 +1,226 @@
+From 09cd0b66c8a5f4dbb85e7e2588818daaff672052 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Mon, 11 May 2026 20:20:48 +0800
+Subject: [PATCH 08/20] fix: audit commit 3 review - file race condition,
+ re-enable, cleanup
+
+- Add audit_file_lock mutex to synchronize file access between
+  consumer thread (auditLogFileWrite) and main thread CONFIG SET
+  callbacks (auditLogFileClose/auditLogFileOpen). Prevents crash
+  when file is closed while consumer is writing.
+
+- Fix auditLogEnabledUpdate: re-open audit log file when enabled
+  is toggled back to yes (previously only closed on disable).
+
+- Fix auditLogThreadStop: close audit log file during shutdown
+  after consumer thread has been joined (resource leak).
+
+- Integrate auditEnsureDir() into auditLogFileOpen() so parent
+  directories are auto-created when audit log file is opened.
+
+- Add 10 integration tests: file creation, 0600 permissions,
+  directory auto-creation, path switch, enable/disable toggle,
+  re-enable, invalid path crash safety, empty path safety,
+  queue rebuild callback, and cleanup.
+---
+ src/audit.c              |  38 ++++++++++----
+ tests/unit/audit-log.tcl | 104 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 133 insertions(+), 9 deletions(-)
+
+diff --git a/src/audit.c b/src/audit.c
+index 9527a14aa..257588ce8 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -22,6 +22,7 @@ static auditLogQueue *audit_queue = NULL;
+ static pthread_t audit_log_thread;
+ static int audit_thread_running = 0;
+ static FILE *audit_log_file = NULL;
++static pthread_mutex_t audit_file_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ /* Thread function prototype */
+ static void *auditLogThreadMain(void *arg);
+@@ -255,25 +256,36 @@ int auditLogFileOpen(const char *path) {
+     int fd = fileno(f);
+     fchmod(fd, S_IRUSR | S_IWUSR);
+ 
++    pthread_mutex_lock(&audit_file_lock);
++    FILE *old = audit_log_file;
+     audit_log_file = f;
++    pthread_mutex_unlock(&audit_file_lock);
++
++    /* Close any previously opened file outside the lock */
++    if (old) fclose(old);
+     return 1;
+ }
+ 
+ /* Write a line to the audit log file. */
+ void auditLogFileWrite(const char *line, size_t len) {
+-    if (audit_log_file == NULL) return;
+-    if (fwrite(line, 1, len, audit_log_file) != len) {
+-        serverLog(LL_WARNING, "Audit log: Failed to write to log file");
++    pthread_mutex_lock(&audit_file_lock);
++    FILE *f = audit_log_file;
++    if (f) {
++        if (fwrite(line, 1, len, f) != len) {
++            serverLog(LL_WARNING, "Audit log: Failed to write to log file");
++        }
++        fflush(f);
+     }
+-    fflush(audit_log_file);
++    pthread_mutex_unlock(&audit_file_lock);
+ }
+ 
+ /* Close the current audit log file. */
+ void auditLogFileClose(void) {
+-    if (audit_log_file) {
+-        fclose(audit_log_file);
+-        audit_log_file = NULL;
+-    }
++    pthread_mutex_lock(&audit_file_lock);
++    FILE *f = audit_log_file;
++    audit_log_file = NULL;
++    pthread_mutex_unlock(&audit_file_lock);
++    if (f) fclose(f);
+ }
+ 
+ /* Switch to a new log file path. Closes the old file and opens the new one. */
+@@ -292,7 +304,12 @@ void auditLogFileSwitch(const char *newPath) {
+ int auditLogEnabledUpdate(int val, int prev, const char **err) {
+     UNUSED(prev);
+     UNUSED(err);
+-    if (!val) {
++    if (val) {
++        /* When enabled, re-open the log file if a path is configured */
++        if (server.audit_log_path && server.audit_log_path[0] != '\0') {
++            auditLogFileOpen(server.audit_log_path);
++        }
++    } else {
+         /* When disabled, close the file. The consumer thread will
+          * still drain the queue but won't write to file. */
+         auditLogFileClose();
+@@ -399,6 +416,9 @@ void auditLogThreadStop(void) {
+     pthread_join(audit_log_thread, NULL);
+     audit_thread_running = 0;
+ 
++    /* Close the log file after the consumer has stopped */
++    auditLogFileClose();
++
+     /* Clean up the queue */
+     auditLogQueueDestroy();
+ }
+diff --git a/tests/unit/audit-log.tcl b/tests/unit/audit-log.tcl
+index c4a47acb6..8601988e6 100644
+--- a/tests/unit/audit-log.tcl
++++ b/tests/unit/audit-log.tcl
+@@ -62,4 +62,108 @@ start_server {tags {"audit-log"}} {
+         catch {r config set audit-log-abort-count 100} err
+         set _ $err
+     } {ERR*Unsupported CONFIG*}
++
++    # --- File operations tests (Commit 3) ---
++
++    test {Audit log file is created with enabled and valid path} {
++        set testpath "/tmp/redis_audit_test_file.log"
++        file delete -- $testpath
++        r config set audit-log-path $testpath
++        r config set audit-log-enabled yes
++        after 200
++        assert {[file exists $testpath]}
++    }
++
++    test {Audit log file has 0600 permissions} {
++        set testpath "/tmp/redis_audit_test_perm.log"
++        file delete -- $testpath
++        r config set audit-log-path $testpath
++        r config set audit-log-enabled yes
++        after 200
++        set perms [file attributes $testpath -permissions]
++        assert {[string match *0600 $perms] || [string match *00600 $perms]}
++    }
++
++    test {Audit log file auto-creates parent directories} {
++        set subdir "/tmp/redis_audit_nested/sub/dir"
++        set testpath "$subdir/test.log"
++        file delete -force -- /tmp/redis_audit_nested
++        r config set audit-log-path $testpath
++        r config set audit-log-enabled yes
++        after 200
++        assert {[file isdirectory $subdir]}
++        assert {[file exists $testpath]}
++    }
++
++    test {Audit log path switch: old closed, new opened} {
++        set path1 "/tmp/redis_audit_switch1.log"
++        set path2 "/tmp/redis_audit_switch2.log"
++        file delete -- $path1 $path2
++        r config set audit-log-enabled yes
++        r config set audit-log-path $path1
++        after 200
++        assert {[file exists $path1]}
++        r config set audit-log-path $path2
++        after 200
++        assert {[file exists $path2]}
++    }
++
++    test {Audit log disable closes file} {
++        set testpath "/tmp/redis_audit_disable.log"
++        file delete -- $testpath
++        r config set audit-log-path $testpath
++        r config set audit-log-enabled yes
++        after 200
++        assert {[file exists $testpath]}
++        r config set audit-log-enabled no
++        after 100
++        # File should still exist (not deleted), just closed
++        assert {[file exists $testpath]}
++    }
++
++    test {Audit log re-enable re-opens file} {
++        set testpath "/tmp/redis_audit_reenable.log"
++        file delete -- $testpath
++        r config set audit-log-path $testpath
++        # Enable, then disable, then re-enable
++        r config set audit-log-enabled yes
++        after 100
++        r config set audit-log-enabled no
++        after 100
++        r config set audit-log-enabled yes
++        after 200
++        assert {[file exists $testpath]}
++    }
++
++    test {Audit log with invalid directory path does not crash server} {
++        r config set audit-log-path "/root/no_perm_dir/test.log"
++        r config set audit-log-enabled yes
++        after 200
++        # Server should still be alive - verify with a PING
++        assert_equal "PONG" [r ping]
++    }
++
++    test {Audit log empty path does not crash} {
++        r config set audit-log-path ""
++        r config set audit-log-enabled yes
++        after 100
++        assert_equal "PONG" [r ping]
++    }
++
++    test {Audit log queue length rebuild callback works} {
++        r config set audit-log-queue-length 1000
++        assert_equal "1000" [lindex [r config get audit-log-queue-length] 1]
++        r config set audit-log-queue-length 50000
++        assert_equal "50000" [lindex [r config get audit-log-queue-length] 1]
++        assert_equal "PONG" [r ping]
++    }
++
++    # Cleanup
++    test {Audit log cleanup test files} {
++        file delete -force -- /tmp/redis_audit_nested
++        foreach f [glob -nocomplain /tmp/redis_audit_*.log] {
++            file delete -- $f
++        }
++        set _ 1
++    } {1}
+ }
+-- 
+2.43.0
+

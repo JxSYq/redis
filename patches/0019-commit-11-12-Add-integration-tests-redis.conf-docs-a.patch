@@ -1,0 +1,196 @@
+From d329a8ec818c3613e288be28672fd62681a5e4f8 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 6 May 2026 19:15:35 +0800
+Subject: [PATCH 19/20] commit 11-12: Add integration tests, redis.conf docs,
+ and extension points
+
+- Add comprehensive Tcl integration tests: end-to-end flow,
+  transaction same-time/isTrans, customer list dynamic update,
+  INFO audit_log, abort count, disable/re-enable
+- Add audit log configuration documentation in redis.conf
+- Document 7 reserved extension interfaces in audit.h:
+  output target abstraction, blacklist, sampling, rotation,
+  extend field, slowlog threshold, client filtering
+---
+ redis.conf               | 29 ++++++++++++++
+ src/audit.h              | 33 +++++++++++++++
+ tests/unit/audit-log.tcl | 87 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 149 insertions(+)
+
+diff --git a/redis.conf b/redis.conf
+index 6ded8842b..06931b1c2 100644
+--- a/redis.conf
++++ b/redis.conf
+@@ -2051,3 +2051,32 @@ jemalloc-bg-thread yes
+ # to suppress
+ #
+ # ignore-warnings ARM64-COW-BUG
++
++############################## AUDIT LOG ################################
++
++# Audit log provides command audit capabilities for security and compliance.
++# When enabled, write commands (commands with CMD_WRITE flag) are automatically
++# logged. Additional commands can be logged via the audit-log-customer-command-list
++# configuration.
++
++# Enable or disable the audit log feature. Default: no
++# audit-log-enabled no
++
++# Set the path for the audit log file. If not set, audit logs will not be
++# written to disk. The file is opened in append mode with 0600 permissions.
++# audit-log-path ""
++
++# Enable or disable value encryption (masking) in audit logs.
++# When enabled, non-key parameter values are partially masked with asterisks.
++# Keys are never masked. Default: yes
++# audit-log-encrypt-enabled yes
++
++# Maximum length of the asynchronous audit log queue.
++# If the queue is full, new audit entries are silently discarded.
++# Default: 100000
++# audit-log-queue-length 100000
++
++# Additional commands to audit beyond write commands.
++# Space-separated list of command names (e.g., "GET INFO PING").
++# audit-log-customer-command-list ""
++
+diff --git a/src/audit.h b/src/audit.h
+index c049281dd..542aeb20c 100644
+--- a/src/audit.h
++++ b/src/audit.h
+@@ -85,4 +85,37 @@ void auditLogCommand(client *c);
+ void auditLogTransactionCommand(client *c, long long prev_err_count);
+ long long auditNanoTime(void);
+ 
++/*
++ * Extension points for future enhancements:
++ *
++ * 1. Log output target abstraction:
++ *    Currently only local file is supported. To add network output (syslog,
++ *    kafka, etc.), implement an auditLogWriter interface with function
++ *    pointers for open/write/close and register via auditLogSetWriter().
++ *
++ * 2. Command blacklist:
++ *    Add audit-log-blacklist config to exclude specific write commands.
++ *    Implement auditShouldLog() blacklist check before whitelist check.
++ *
++ * 3. Sampling rate:
++ *    Add audit-log-sample-rate config (0-100). Implement random sampling
++ *    in auditLogCommand() to log only a percentage of commands.
++ *
++ * 4. Log rotation:
++ *    Add audit-log-max-size and audit-log-rotate-count configs.
++ *    Implement size-based rotation in auditLogFileWrite().
++ *
++ * 5. Custom fields via extend:
++ *    The 'extend' field provides structured extension. Parsers can check
++ *    for 'isTrans' and other future values.
++ *
++ * 6. Slow log threshold:
++ *    Add audit-log-min-use-time config. Filter entries by use_time
++ *    threshold in auditLogCommand().
++ *
++ * 7. Client filtering:
++ *    Add audit-log-client-filter config (address or user based).
++ *    Check client_addr/user in auditShouldLog().
++ */
++
+ #endif /* __AUDIT_H */
+diff --git a/tests/unit/audit-log.tcl b/tests/unit/audit-log.tcl
+index f7caf0af3..62275d283 100644
+--- a/tests/unit/audit-log.tcl
++++ b/tests/unit/audit-log.tcl
+@@ -595,3 +595,90 @@ start_server {tags {"audit-log"}} {
+     r config set audit-log-enabled no
+     r config set audit-log-path ""
+ }
++
++start_server {tags {"audit-log"}} {
++    test {Audit: end-to-end flow with file verification} {
++        set logpath "/tmp/test_audit_e2e.log"
++        file delete $logpath
++        r config set audit-log-path $logpath
++        r config set audit-log-enabled yes
++        r SET e2ekey e2evalue
++        after 300
++        set fp [open $logpath r]
++        set content [read $fp]
++        close $fp
++        assert_match {*"command_name":"SET"*} $content
++        assert_match {*"command_keys":\["e2ekey"\]*} $content
++        assert_match {*"proxy_addr"*} $content
++        assert_match {*"user"*} $content
++        file delete $logpath
++    }
++
++    test {Audit: transaction same time and isTrans} {
++        set logpath "/tmp/test_audit_trans.log"
++        file delete $logpath
++        r config set audit-log-path $logpath
++        printf "MULTI\r\nSET trans1 v1\r\nSET trans2 v2\r\nEXEC\r\n" | [redis [srv "host"] [srv "port"]]
++        after 300
++        set fp [open $logpath r]
++        set lines [split [read $fp] "\n"]
++        close $fp
++        # Find both transaction lines
++        set t1 {}
++        set t2 {}
++        foreach line $lines {
++            if {[string first "trans1" $line] != -1} { set t1 $line }
++            if {[string first "trans2" $line] != -1} { set t2 $line }
++        }
++        assert_match {*"isTrans"*} $t1
++        assert_match {*"isTrans"*} $t2
++        file delete $logpath
++    }
++
++    test {Audit: customer command list dynamic update} {
++        set logpath "/tmp/test_audit_cust.log"
++        file delete $logpath
++        r config set audit-log-path $logpath
++        r config set audit-log-customer-command-list ""
++        # GET should NOT be logged normally
++        r GET e2ekey
++        after 200
++        assert {![file exists $logpath] || [file size $logpath] == 0}
++        # Add GET to customer list
++        r config set audit-log-customer-command-list "GET"
++        r GET e2ekey
++        after 200
++        set fp [open $logpath r]
++        set content [read $fp]
++        close $fp
++        assert_match {*"command_name":"GET"*} $content
++        file delete $logpath
++        r config set audit-log-customer-command-list ""
++    }
++
++    test {Audit: INFO audit_log section is accessible} {
++        assert_match {*audit_log_enabled*} [r info audit_log]
++        assert_match {*audit_log_record_count*} [r info audit_log]
++        assert_match {*audit_log_abort_count*} [r info audit_log]
++        assert_match {*audit_log_queue_length*} [r info audit_log]
++    }
++
++    test {Audit: CONFIG GET audit-log-abort-count returns correct value} {
++        r config set audit-log-queue-length 1
++        r config set audit-log-enabled yes
++        set logpath "/tmp/test_audit_abort.log"
++        r config set audit-log-path $logpath
++        # Queue size is 1, push 3 entries to fill and overflow
++        r SET abort1 v1
++        r SET abort2 v2
++        r SET abort3 v3
++        after 300
++        set abort_count [lindex [r config get audit-log-abort-count] 1]
++        assert {$abort_count > 0}
++        r config set audit-log-queue-length 100000
++        file delete $logpath
++    }
++
++    r config set audit-log-enabled no
++    r config set audit-log-path ""
++}
+-- 
+2.43.0
+

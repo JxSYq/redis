@@ -1,0 +1,89 @@
+From 023692b5192a7e72e6c1534733fb59e75f3ba0ad Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Mon, 11 May 2026 19:46:08 +0800
+Subject: [PATCH 06/20] fix: add auditEnsureDir() to auto-create parent
+ directories for audit log path
+
+- Recursively creates all parent directories in the audit log file path
+- Uses stat() to check existence and mkdir() with 0755 permissions
+- Handles EEXIST gracefully (directory already exists)
+- Fails if a path component exists but is not a directory
+- Returns 0 on success, -1 on failure; errors are non-fatal
+---
+ src/audit.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ src/audit.h |  3 +++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/src/audit.c b/src/audit.c
+index 7e38f4a7a..4de58b197 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -2,6 +2,8 @@
+ #include "server.h"
+ #include <pthread.h>
+ #include <signal.h>
++#include <sys/stat.h>
++#include <errno.h>
+ 
+ /* Ring buffer queue for asynchronous audit logging */
+ typedef struct auditLogQueue {
+@@ -189,6 +191,44 @@ void auditLogQueueRebuild(int new_capacity) {
+     pthread_mutex_unlock(&audit_queue->lock);
+ }
+ 
++/* --------------------------------------------------------------------------
++ * File utility
++ * -------------------------------------------------------------------------- */
++
++/* Recursively create all parent directories needed for the given file path.
++ * Returns 0 on success, -1 on failure. Does not fail if directories already
++ * exist. Directory permissions are 0755 (subject to umask). */
++int auditEnsureDir(const char *filepath) {
++    if (filepath == NULL || *filepath == '\0') return -1;
++
++    char *path = zstrdup(filepath);
++    int ret = 0;
++
++    /* Walk the path, creating each directory level. Skip the root '/'. */
++    for (char *p = (path[0] == '/') ? path + 1 : path; *p; p++) {
++        if (*p == '/') {
++            *p = '\0';
++            if (path[0] != '\0') {
++                struct stat st;
++                if (stat(path, &st) == -1) {
++                    if (mkdir(path, 0755) == -1 && errno != EEXIST) {
++                        ret = -1;
++                        goto cleanup;
++                    }
++                } else if (!S_ISDIR(st.st_mode)) {
++                    ret = -1;
++                    goto cleanup;
++                }
++            }
++            *p = '/';
++        }
++    }
++
++cleanup:
++    zfree(path);
++    return ret;
++}
++
+ /* --------------------------------------------------------------------------
+  * Consumer thread
+  * -------------------------------------------------------------------------- */
+diff --git a/src/audit.h b/src/audit.h
+index 3c18291ce..9e2c7dcc1 100644
+--- a/src/audit.h
++++ b/src/audit.h
+@@ -23,4 +23,7 @@ void auditLogThreadStop(void);
+ /* Queue rebuild for capacity change */
+ void auditLogQueueRebuild(int new_capacity);
+ 
++/* File utility: create parent directories for a file path */
++int auditEnsureDir(const char *filepath);
++
+ #endif /* __AUDIT_H */
+-- 
+2.43.0
+
