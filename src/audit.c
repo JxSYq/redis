@@ -1146,9 +1146,14 @@ auditLogEntry *auditCreateEntry(client *c) {
     entry->command_name = sdsnew(c->argv[0]->ptr);
     entry->command_type = sdsnew(auditGetCommandType(c->argv[0]->ptr));
 
-    entry->command_keys = auditExtractKeys(c, &entry->num_keys);
-    entry->command_param = auditBuildCommandParam(c, entry->command_keys,
-        entry->num_keys, server.audit_log_encrypt_enabled);
+    {
+        int *key_positions = NULL;
+        entry->command_keys = auditExtractKeys(c, &entry->num_keys,
+                                               &key_positions);
+        entry->command_param = auditBuildCommandParam(c, entry->command_keys,
+            entry->num_keys, key_positions, server.audit_log_encrypt_enabled);
+        zfree(key_positions);
+    }
 
     entry->use_time = 0;
     entry->extend = sdsempty();
