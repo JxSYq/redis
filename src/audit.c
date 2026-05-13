@@ -201,9 +201,12 @@ void auditLogQueueRebuild(int new_capacity) {
  * Returns 0 on success, -1 on failure. Does not fail if directories already
  * exist. Directory permissions are 0755 (subject to umask). */
 int auditEnsureDir(const char *filepath) {
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditEnsureDir: filepath='%s' (ptr=%p)",
+              filepath ? filepath : "(null)", (void*)filepath);
     if (filepath == NULL || *filepath == '\0') return -1;
 
     char *path = zstrdup(filepath);
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditEnsureDir: zstrdup copy='%s'", path);
     int ret = 0;
 
     /* Walk the path, creating each directory level. Skip the root '/'. */
@@ -227,6 +230,8 @@ int auditEnsureDir(const char *filepath) {
     }
 
 cleanup:
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditEnsureDir: returning ret=%d, original filepath='%s'",
+              ret, filepath ? filepath : "(null)");
     zfree(path);
     return ret;
 }
@@ -239,6 +244,9 @@ cleanup:
  * Creates parent directories if they don't exist.
  * Returns 1 on success, 0 on failure. */
 int auditLogFileOpen(const char *path) {
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditLogFileOpen: path='%s' (len=%zu)",
+              path ? path : "(null)",
+              path ? strlen(path) : 0);
     if (!path || path[0] == '\0') return 0;
 
     /* Ensure parent directories exist before opening file */
@@ -289,6 +297,8 @@ void auditLogFileClose(void) {
 
 /* Switch to a new log file path. Closes the old file and opens the new one. */
 void auditLogFileSwitch(const char *newPath) {
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditLogFileSwitch: newPath='%s' (ptr=%p)",
+              newPath ? newPath : "(null)", (void*)newPath);
     auditLogFileClose();
     if (newPath && newPath[0] != '\0') {
         auditLogFileOpen(newPath);
@@ -303,6 +313,8 @@ void auditLogFileSwitch(const char *newPath) {
 int auditLogEnabledUpdate(int val, int prev, const char **err) {
     UNUSED(prev);
     UNUSED(err);
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditLogEnabledUpdate: val=%d, prev=%d, path='%s'",
+              val, prev, server.audit_log_path ? server.audit_log_path : "(null)");
     if (!val) {
         /* When disabled, close the file. The consumer thread will
          * still drain the queue but won't write to file. */
@@ -317,6 +329,9 @@ int auditLogEnabledUpdate(int val, int prev, const char **err) {
 int auditLogPathUpdate(char *val, char *prev, const char **err) {
     UNUSED(prev);
     UNUSED(err);
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditLogPathUpdate: val='%s' (ptr=%p), prev='%s'",
+              val ? val : "(null)", (void*)val,
+              prev ? prev : "(null)");
     auditLogFileSwitch(val);
     return 1;
 }

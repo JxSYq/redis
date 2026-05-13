@@ -1802,6 +1802,10 @@ static int stringConfigSet(typeData data, sds value, int update, const char **er
         return 0;
     char *prev = *data.string.config;
     *data.string.config = (data.string.convert_empty_to_null && !value[0]) ? NULL : zstrdup(value);
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] stringConfigSet: value='%s' (len=%zu), stored='%s' (ptr=%p)",
+              value, sdslen(value),
+              *data.string.config ? *data.string.config : "(null)",
+              (void*)(*data.string.config));
     if (update && data.string.update_fn && !data.string.update_fn(*data.string.config, prev, err)) {
         zfree(*data.string.config);
         *data.string.config = prev;
@@ -1812,6 +1816,9 @@ static int stringConfigSet(typeData data, sds value, int update, const char **er
 }
 
 static void stringConfigGet(client *c, typeData data) {
+    serverLog(LL_WARNING, "[AUDIT-DEBUG] stringConfigGet: ptr=%p, value='%s'",
+              (void*)(*data.string.config),
+              *data.string.config ? *data.string.config : "(null)");
     addReplyBulkCString(c, *data.string.config ? *data.string.config : "");
 }
 
