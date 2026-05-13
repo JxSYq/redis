@@ -1029,8 +1029,20 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
     for (int i = 1; i < c->argc; i++) {
         result = sdscatlen(result, " ", 1);
 
-        const char *arg = c->argv[i]->ptr;
-        size_t arglen = sdslen(c->argv[i]->ptr);
+        robj *o = c->argv[i];
+        char intbuf[32];
+        const char *arg;
+        size_t arglen;
+
+        /* Handle integer-encoded objects (e.g. after tryObjectEncoding).
+         * For INT encoding, ptr stores the integer value, not a valid pointer. */
+        if (o->encoding == OBJ_ENCODING_INT) {
+            arglen = (size_t)ll2string(intbuf, sizeof(intbuf), (long)o->ptr);
+            arg = intbuf;
+        } else {
+            arg = o->ptr;
+            arglen = sdslen(o->ptr);
+        }
 
         int is_key = (numkeys > 0 && key_positions != NULL) ?
             auditArgIsKeyByPosition(key_positions, numkeys, i) : 0;
