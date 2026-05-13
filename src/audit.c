@@ -1034,9 +1034,10 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
         const char *arg;
         size_t arglen;
 
-        /* Handle integer-encoded objects (e.g. after tryObjectEncoding).
+        /* Handle non-SDS-encoded objects (e.g. OBJ_ENCODING_INT after
+         * tryObjectEncoding or rewriteClientCommandVector).
          * For INT encoding, ptr stores the integer value, not a valid pointer. */
-        if (o->encoding == OBJ_ENCODING_INT) {
+        if (!sdsEncodedObject(o)) {
             arglen = (size_t)ll2string(intbuf, sizeof(intbuf), (long)o->ptr);
             arg = intbuf;
         } else {
