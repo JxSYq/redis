@@ -1,0 +1,102 @@
+From 703608bd646d29c98284ae8d09366088e3ed33b7 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 13 May 2026 11:48:36 +0800
+Subject: [PATCH 1/3] log-1
+
+---
+ src/audit.c  | 15 +++++++++++++++
+ src/config.c |  7 +++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/src/audit.c b/src/audit.c
+index 507e346f2..5276c7488 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -201,9 +201,12 @@ void auditLogQueueRebuild(int new_capacity) {
+  * Returns 0 on success, -1 on failure. Does not fail if directories already
+  * exist. Directory permissions are 0755 (subject to umask). */
+ int auditEnsureDir(const char *filepath) {
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditEnsureDir: filepath='%s' (ptr=%p)",
++              filepath ? filepath : "(null)", (void*)filepath);
+     if (filepath == NULL || *filepath == '\0') return -1;
+ 
+     char *path = zstrdup(filepath);
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditEnsureDir: zstrdup copy='%s'", path);
+     int ret = 0;
+ 
+     /* Walk the path, creating each directory level. Skip the root '/'. */
+@@ -227,6 +230,8 @@ int auditEnsureDir(const char *filepath) {
+     }
+ 
+ cleanup:
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditEnsureDir: returning ret=%d, original filepath='%s'",
++              ret, filepath ? filepath : "(null)");
+     zfree(path);
+     return ret;
+ }
+@@ -239,6 +244,9 @@ cleanup:
+  * Creates parent directories if they don't exist.
+  * Returns 1 on success, 0 on failure. */
+ int auditLogFileOpen(const char *path) {
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditLogFileOpen: path='%s' (len=%zu)",
++              path ? path : "(null)",
++              path ? strlen(path) : 0);
+     if (!path || path[0] == '\0') return 0;
+ 
+     /* Ensure parent directories exist before opening file */
+@@ -289,6 +297,8 @@ void auditLogFileClose(void) {
+ 
+ /* Switch to a new log file path. Closes the old file and opens the new one. */
+ void auditLogFileSwitch(const char *newPath) {
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditLogFileSwitch: newPath='%s' (ptr=%p)",
++              newPath ? newPath : "(null)", (void*)newPath);
+     auditLogFileClose();
+     if (newPath && newPath[0] != '\0') {
+         auditLogFileOpen(newPath);
+@@ -303,6 +313,8 @@ void auditLogFileSwitch(const char *newPath) {
+ int auditLogEnabledUpdate(int val, int prev, const char **err) {
+     UNUSED(prev);
+     UNUSED(err);
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditLogEnabledUpdate: val=%d, prev=%d, path='%s'",
++              val, prev, server.audit_log_path ? server.audit_log_path : "(null)");
+     if (!val) {
+         /* When disabled, close the file. The consumer thread will
+          * still drain the queue but won't write to file. */
+@@ -317,6 +329,9 @@ int auditLogEnabledUpdate(int val, int prev, const char **err) {
+ int auditLogPathUpdate(char *val, char *prev, const char **err) {
+     UNUSED(prev);
+     UNUSED(err);
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] auditLogPathUpdate: val='%s' (ptr=%p), prev='%s'",
++              val ? val : "(null)", (void*)val,
++              prev ? prev : "(null)");
+     auditLogFileSwitch(val);
+     return 1;
+ }
+diff --git a/src/config.c b/src/config.c
+index 5078ce7ad..3b6ba0488 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -1802,6 +1802,10 @@ static int stringConfigSet(typeData data, sds value, int update, const char **er
+         return 0;
+     char *prev = *data.string.config;
+     *data.string.config = (data.string.convert_empty_to_null && !value[0]) ? NULL : zstrdup(value);
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] stringConfigSet: value='%s' (len=%zu), stored='%s' (ptr=%p)",
++              value, sdslen(value),
++              *data.string.config ? *data.string.config : "(null)",
++              (void*)(*data.string.config));
+     if (update && data.string.update_fn && !data.string.update_fn(*data.string.config, prev, err)) {
+         zfree(*data.string.config);
+         *data.string.config = prev;
+@@ -1812,6 +1816,9 @@ static int stringConfigSet(typeData data, sds value, int update, const char **er
+ }
+ 
+ static void stringConfigGet(client *c, typeData data) {
++    serverLog(LL_WARNING, "[AUDIT-DEBUG] stringConfigGet: ptr=%p, value='%s'",
++              (void*)(*data.string.config),
++              *data.string.config ? *data.string.config : "(null)");
+     addReplyBulkCString(c, *data.string.config ? *data.string.config : "");
+ }
+ 
+-- 
+2.43.0
+

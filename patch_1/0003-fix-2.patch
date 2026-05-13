@@ -1,0 +1,29 @@
+From b2eced5a852cb10d81344e5cba70aea3e70fd6ff Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Wed, 13 May 2026 12:57:39 +0800
+Subject: [PATCH 3/3] fix-2
+
+---
+ src/audit.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/audit.c b/src/audit.c
+index 14cf868ff..1bc31e319 100644
+--- a/src/audit.c
++++ b/src/audit.c
+@@ -1034,9 +1034,10 @@ sds auditBuildCommandParam(client *c, sds *keys, int numkeys,
+         const char *arg;
+         size_t arglen;
+ 
+-        /* Handle integer-encoded objects (e.g. after tryObjectEncoding).
++        /* Handle non-SDS-encoded objects (e.g. OBJ_ENCODING_INT after
++         * tryObjectEncoding or rewriteClientCommandVector).
+          * For INT encoding, ptr stores the integer value, not a valid pointer. */
+-        if (o->encoding == OBJ_ENCODING_INT) {
++        if (!sdsEncodedObject(o)) {
+             arglen = (size_t)ll2string(intbuf, sizeof(intbuf), (long)o->ptr);
+             arg = intbuf;
+         } else {
+-- 
+2.43.0
+
