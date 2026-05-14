@@ -1289,6 +1289,80 @@ void auditFreeEntry(auditLogEntry *entry) {
 
 static dict *audit_customer_command_dict = NULL;
 
+/* Dict of write subcommands: key = "PARENT|SUB" (uppercase), value = NULL.
+ * Used for O(1) lookup in auditShouldLog. Built once at startup. */
+static dict *audit_write_subcommand_dict = NULL;
+
+/* Dict type for write subcommand dict (case-insensitive SDS keys). */
+dictType writeSubcommandDictType = {
+    dictSdsHash,
+    NULL,
+    NULL,
+    dictSdsKeyCompare,
+    dictSdsDestructor,
+    NULL,
+    NULL
+};
+
+#define ADD_WRITE_SUB(parent, sub) do { \
+    sds _key = sdscatprintf(sdsempty(), "%s|%s", parent, sub); \
+    sdstoupper(_key); \
+    dictAdd(audit_write_subcommand_dict, _key, NULL); \
+} while(0)
+
+void auditWriteSubcommandInit(void) {
+    if (audit_write_subcommand_dict != NULL) return;
+    audit_write_subcommand_dict = dictCreate(&writeSubcommandDictType, NULL);
+
+    ADD_WRITE_SUB("CLIENT",  "KILL");
+    ADD_WRITE_SUB("CLIENT",  "PAUSE");
+    ADD_WRITE_SUB("CLIENT",  "UNPAUSE");
+    ADD_WRITE_SUB("CLIENT",  "NO-EVICT");
+    ADD_WRITE_SUB("CLIENT",  "SETNAME");
+    ADD_WRITE_SUB("CLIENT",  "REPLY");
+    ADD_WRITE_SUB("CLIENT",  "TRACKING");
+    ADD_WRITE_SUB("CLIENT",  "CACHING");
+    ADD_WRITE_SUB("CLIENT",  "UNBLOCK");
+
+    ADD_WRITE_SUB("CONFIG",  "SET");
+    ADD_WRITE_SUB("CONFIG",  "REWRITE");
+    ADD_WRITE_SUB("CONFIG",  "RESETSTAT");
+
+    ADD_WRITE_SUB("CLUSTER", "ADDSLOTS");
+    ADD_WRITE_SUB("CLUSTER", "ADDSLOTSRANGE");
+    ADD_WRITE_SUB("CLUSTER", "BUMPEPOCH");
+    ADD_WRITE_SUB("CLUSTER", "DELSLOTS");
+    ADD_WRITE_SUB("CLUSTER", "DELSLOTSRANGE");
+    ADD_WRITE_SUB("CLUSTER", "FAILOVER");
+    ADD_WRITE_SUB("CLUSTER", "FLUSHSLOTS");
+    ADD_WRITE_SUB("CLUSTER", "FORGET");
+    ADD_WRITE_SUB("CLUSTER", "MEET");
+    ADD_WRITE_SUB("CLUSTER", "REPLICATE");
+    ADD_WRITE_SUB("CLUSTER", "RESET");
+    ADD_WRITE_SUB("CLUSTER", "SAVECONFIG");
+    ADD_WRITE_SUB("CLUSTER", "SET-CONFIG-EPOCH");
+    ADD_WRITE_SUB("CLUSTER", "SETSLOT");
+
+    ADD_WRITE_SUB("SCRIPT",  "LOAD");
+    ADD_WRITE_SUB("SCRIPT",  "FLUSH");
+    ADD_WRITE_SUB("SCRIPT",  "KILL");
+
+    ADD_WRITE_SUB("ACL",     "DELUSER");
+    ADD_WRITE_SUB("ACL",     "LOAD");
+    ADD_WRITE_SUB("ACL",     "SAVE");
+    ADD_WRITE_SUB("ACL",     "SETUSER");
+
+    ADD_WRITE_SUB("MODULE",  "LOAD");
+    ADD_WRITE_SUB("MODULE",  "LOADEX");
+    ADD_WRITE_SUB("MODULE",  "UNLOAD");
+
+    ADD_WRITE_SUB("SLOWLOG", "RESET");
+
+    ADD_WRITE_SUB("LATENCY", "RESET");
+
+    ADD_WRITE_SUB("MEMORY",  "PURGE");
+}
+
 static dictType customerCommandDictType = {
     dictSdsCaseHash,
     NULL,
@@ -1325,6 +1399,19 @@ void auditRebuildCustomerCommandDict(void) {
     }
 }
 
+/* Check if a parent command with a given subcommand is a write operation.
+ * Uses a pre-built dict for O(1) lookup. */
+static int auditIsWriteSubcommand(const char *parent, const char *sub) {
+    if (!parent || !sub || !*sub) return 0;
+    if (!audit_write_subcommand_dict) return 0;
+
+    sds key = sdscatprintf(sdsempty(), "%s|%s", parent, sub);
+    sdstoupper(key);
+    dictEntry *de = dictFind(audit_write_subcommand_dict, key);
+    sdsfree(key);
+    return (de != NULL);
+}
+
 /* Check if the command should be audited. */
 int auditShouldLog(client *c) {
     if (!server.audit_log_enabled) return 0;
@@ -1332,6 +1419,10 @@ int auditShouldLog(client *c) {
 
     /* Write commands */
     if (c->cmd->flags & CMD_WRITE) return 1;
+
+    /* Parent commands with write subcommands (no CMD_WRITE on parent) */
+    if (c->argc >= 2 && auditIsWriteSubcommand(c->argv[0]->ptr, c->argv[1]->ptr))
+        return 1;
 
     /* Customer command list */
     if (audit_customer_command_dict) {

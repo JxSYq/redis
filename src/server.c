@@ -3381,6 +3381,7 @@ void initServer(void) {
     latencyMonitorInit();
     auditCommandTypeInit();
     auditRebuildCustomerCommandDict();
+    auditWriteSubcommandInit();
 
     /* Initialize ACL default password if it exists */
     ACLUpdateDefaultUserPassword(server.requirepass);

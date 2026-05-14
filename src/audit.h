@@ -63,6 +63,7 @@ int auditCustomerCommandListUpdate(char *val, char *prev, const char **err);
 
 /* Command type mapping */
 void auditCommandTypeInit(void);
+void auditWriteSubcommandInit(void);
 const char *auditGetCommandType(const char *cmdName);
 
 /* Command keys extraction */

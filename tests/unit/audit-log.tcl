@@ -548,9 +548,14 @@ start_server {tags {"audit-log"}} {
 
     test {Audit: read commands NOT logged by default} {
         r config set audit-log-path /tmp/test_audit_read.log
+        after 200
+        # CONFIG SET itself is audited; verify GET is not
         r GET audit_write_key
         after 200
-        assert {![file exists /tmp/test_audit_read.log] || [file size /tmp/test_audit_read.log] == 0}
+        set fp [open /tmp/test_audit_read.log r]
+        set content [read $fp]
+        close $fp
+        assert {[string first "GET" $content] == -1}
         file delete /tmp/test_audit_read.log
     }
 
@@ -569,9 +574,14 @@ start_server {tags {"audit-log"}} {
 
     test {Audit: failed commands NOT logged} {
         r config set audit-log-path /tmp/test_audit_fail.log
+        after 200
+        # CONFIG SET itself is audited; verify failed INCR is not
         catch {r INCR audit_write_key} err
         after 200
-        assert {![file exists /tmp/test_audit_fail.log] || [file size /tmp/test_audit_fail.log] == 0}
+        set fp [open /tmp/test_audit_fail.log r]
+        set content [read $fp]
+        close $fp
+        assert {[string first "INCR" $content] == -1}
         file delete /tmp/test_audit_fail.log
     }
 
@@ -644,12 +654,19 @@ start_server {tags {"audit-log"}} {
         file delete $logpath
         r config set audit-log-path $logpath
         r config set audit-log-customer-command-list ""
-        # GET should NOT be logged normally
+        after 200
+        # CONFIG SET itself is audited; verify GET is NOT logged when list is empty
         r GET e2ekey
         after 200
-        assert {![file exists $logpath] || [file size $logpath] == 0}
+        if {[file exists $logpath]} {
+            set fp [open $logpath r]
+            set content [read $fp]
+            close $fp
+            assert {[string first "\"command_name\":\"GET\"" $content] == -1}
+        }
         # Add GET to customer list
         r config set audit-log-customer-command-list "GET"
+        after 200
         r GET e2ekey
         after 200
         set fp [open $logpath r]
