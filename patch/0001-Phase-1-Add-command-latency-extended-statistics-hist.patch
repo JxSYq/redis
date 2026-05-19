@@ -1,0 +1,735 @@
+From 029e18d5c17ac7fa812061f6ed9e5cbf8c34dd0e Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Tue, 19 May 2026 10:51:55 +0800
+Subject: [PATCH 1/2] Phase 1: Add command latency extended statistics -
+ histogram framework, all-time metrics, and config entries
+
+- Add histogram.h: abstract histogram interface with vtable pattern
+- Add histogram_logbucket.c: log-bucket histogram implementation (30 buckets, O(1) insert)
+- Add command_stats.c: ext stats lifecycle, latency recording, window aggregation
+- server.h: add commandExtStats/slot5s/slotMinute types, fields to redisServer and redisCommand
+- server.c: hook into call(), INFO commandstats, serverCron rotation, init and reset
+- config.c: add command-latency-tracking (bool) and command-latency-histogram-type (enum)
+- Makefile: add histogram_logbucket.o and command_stats.o
+
+Supported metrics: usec_min, usec_max, usec_p95, usec_p99 (all-time),
+5-second window (calls, usec, min, avg, max),
+1-minute window (calls, usec, min, avg, max, p95, p99),
+and cmdstat_-/r/w/o aggregation categories.
+---
+ src/Makefile              |   2 +-
+ src/command_stats.c       | 278 ++++++++++++++++++++++++++++++++++++++
+ src/config.c              |   7 +
+ src/histogram.h           |  54 ++++++++
+ src/histogram_logbucket.c |  79 +++++++++++
+ src/server.c              |  59 +++++++-
+ src/server.h              |  64 +++++++++
+ 7 files changed, 539 insertions(+), 4 deletions(-)
+ create mode 100644 src/command_stats.c
+ create mode 100644 src/histogram.h
+ create mode 100644 src/histogram_logbucket.c
+
+diff --git a/src/Makefile b/src/Makefile
+index 7d75c83d2..efc121f36 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -290,7 +290,7 @@ endif
+ 
+ REDIS_SERVER_NAME=redis-server$(PROG_SUFFIX)
+ REDIS_SENTINEL_NAME=redis-sentinel$(PROG_SUFFIX)
+-REDIS_SERVER_OBJ=adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o scripting.o bio.o rio.o rand.o memtest.o crcspeed.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o acl.o gopher.o tracking.o connection.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o
++REDIS_SERVER_OBJ=adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o scripting.o bio.o rio.o rand.o memtest.o crcspeed.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o acl.o gopher.o tracking.o connection.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o histogram_logbucket.o command_stats.o
+ REDIS_CLI_NAME=redis-cli$(PROG_SUFFIX)
+ REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o crcspeed.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o
+ REDIS_BENCHMARK_NAME=redis-benchmark$(PROG_SUFFIX)
+diff --git a/src/command_stats.c b/src/command_stats.c
+new file mode 100644
+index 000000000..1f0241414
+--- /dev/null
++++ b/src/command_stats.c
+@@ -0,0 +1,278 @@
++#include "server.h"
++
++/* ---- Lazy initialization ---- */
++
++commandExtStats* initCommandExtStats(void) {
++    commandExtStats *es = zcalloc(sizeof(commandExtStats));
++
++    es->usec_min_alltime = UINT64_MAX;
++    es->usec_max_alltime = 0;
++
++    histogramType t = server.command_latency_histogram_type;
++
++    es->hist_alltime.type = t;
++    es->hist_alltime.impl = histogram_engines[t].create();
++
++    for (int i = 0; i < 5; i++) {
++        es->slots_5s[i].usec_min = UINT64_MAX;
++    }
++
++    for (int i = 0; i < 12; i++) {
++        es->slots_minute[i].usec_min = UINT64_MAX;
++        es->slots_minute[i].hist.type = t;
++        es->slots_minute[i].hist.impl = histogram_engines[t].create();
++    }
++
++    return es;
++}
++
++void freeCommandExtStats(commandExtStats *es) {
++    if (es == NULL) return;
++
++    histogramDestroy(&es->hist_alltime);
++    for (int i = 0; i < 12; i++) {
++        histogramDestroy(&es->slots_minute[i].hist);
++    }
++    zfree(es);
++}
++
++void resetCommandExtStats(commandExtStats *es) {
++    if (es == NULL) return;
++
++    es->calls_alltime = 0;
++    es->usec_alltime = 0;
++    es->usec_min_alltime = UINT64_MAX;
++    es->usec_max_alltime = 0;
++    histogramReset(&es->hist_alltime);
++
++    for (int i = 0; i < 5; i++) {
++        es->slots_5s[i].calls    = 0;
++        es->slots_5s[i].usec     = 0;
++        es->slots_5s[i].usec_min = UINT64_MAX;
++        es->slots_5s[i].usec_max = 0;
++    }
++
++    for (int i = 0; i < 12; i++) {
++        es->slots_minute[i].calls    = 0;
++        es->slots_minute[i].usec     = 0;
++        es->slots_minute[i].usec_min = UINT64_MAX;
++        es->slots_minute[i].usec_max = 0;
++        histogramReset(&es->slots_minute[i].hist);
++    }
++}
++
++/* ---- Command classification ---- */
++
++int classifyCommandCategory(struct redisCommand *cmd) {
++    if (cmd->flags & CMD_ADMIN) return 3; /* other */
++    if (cmd->flags & CMD_READONLY) return 1; /* read */
++    if (cmd->flags & CMD_WRITE) return 2; /* write */
++    return 3; /* other */
++}
++
++/* ---- Hot path: record command latency ---- */
++
++static void recordExtLatency(commandExtStats *es, uint64_t d) {
++    if (es == NULL) return;
++
++    es->calls_alltime++;
++    es->usec_alltime += d;
++
++    if (d < es->usec_min_alltime) es->usec_min_alltime = d;
++    if (d > es->usec_max_alltime) es->usec_max_alltime = d;
++    histogramRecord(&es->hist_alltime, d);
++
++    slot5s *s5 = &es->slots_5s[es->cur_5s_slot];
++    s5->calls++;
++    s5->usec += d;
++    if (d < s5->usec_min) s5->usec_min = d;
++    if (d > s5->usec_max) s5->usec_max = d;
++
++    slotMinute *sm = &es->slots_minute[es->cur_minute_slot];
++    sm->calls++;
++    sm->usec += d;
++    if (d < sm->usec_min) sm->usec_min = d;
++    if (d > sm->usec_max) sm->usec_max = d;
++    histogramRecord(&sm->hist, d);
++}
++
++void updateCommandExtLatency(client *c, ustime_t duration) {
++    if (!server.command_latency_tracking) return;
++
++    struct redisCommand *cmd = c->cmd;
++    uint64_t d = (uint64_t)duration;
++
++    if (cmd->ext_stats == NULL) {
++        cmd->ext_stats = initCommandExtStats();
++    }
++
++    recordExtLatency(cmd->ext_stats, d);
++
++    int cat = classifyCommandCategory(cmd);
++    switch (cat) {
++        case 1: recordExtLatency(server.category_read, d); break;
++        case 2: recordExtLatency(server.category_write, d); break;
++        default: recordExtLatency(server.category_other, d); break;
++    }
++    recordExtLatency(server.category_all, d);
++}
++
++/* ---- Sliding window rotation ---- */
++
++static void rotate5sSlot(commandExtStats *es) {
++    es->cur_5s_slot = (es->cur_5s_slot + 1) % 5;
++    slot5s *s = &es->slots_5s[es->cur_5s_slot];
++    s->calls    = 0;
++    s->usec     = 0;
++    s->usec_min = UINT64_MAX;
++    s->usec_max = 0;
++}
++
++static void rotateMinuteSlot(commandExtStats *es) {
++    es->cur_minute_slot = (es->cur_minute_slot + 1) % 12;
++    slotMinute *m = &es->slots_minute[es->cur_minute_slot];
++    m->calls    = 0;
++    m->usec     = 0;
++    m->usec_min = UINT64_MAX;
++    m->usec_max = 0;
++    histogramReset(&m->hist);
++}
++
++static void rotateAllStats5sSlots(void) {
++    dictIterator *di = dictGetSafeIterator(server.commands);
++    dictEntry *de;
++    while ((de = dictNext(di)) != NULL) {
++        struct redisCommand *c = dictGetVal(de);
++        if (c->ext_stats) rotate5sSlot(c->ext_stats);
++    }
++    dictReleaseIterator(di);
++    if (server.category_all)  rotate5sSlot(server.category_all);
++    if (server.category_read) rotate5sSlot(server.category_read);
++    if (server.category_write) rotate5sSlot(server.category_write);
++    if (server.category_other) rotate5sSlot(server.category_other);
++}
++
++static void rotateAllStatsMinuteSlots(void) {
++    dictIterator *di = dictGetSafeIterator(server.commands);
++    dictEntry *de;
++    while ((de = dictNext(di)) != NULL) {
++        struct redisCommand *c = dictGetVal(de);
++        if (c->ext_stats) rotateMinuteSlot(c->ext_stats);
++    }
++    dictReleaseIterator(di);
++    if (server.category_all)  rotateMinuteSlot(server.category_all);
++    if (server.category_read) rotateMinuteSlot(server.category_read);
++    if (server.category_write) rotateMinuteSlot(server.category_write);
++    if (server.category_other) rotateMinuteSlot(server.category_other);
++}
++
++void cronRotateLatencySlots(void) {
++    if (!server.command_latency_tracking) return;
++
++    mstime_t now = mstime();
++
++    if (now - server.last_5s_rotate_time >= 1000) {
++        server.last_5s_rotate_time = now;
++        rotateAllStats5sSlots();
++    }
++
++    if (now - server.last_minute_rotate_time >= 5000) {
++        server.last_minute_rotate_time = now;
++        rotateAllStatsMinuteSlots();
++    }
++}
++
++/* ---- Window aggregation for INFO output ---- */
++
++void aggregate5s(commandExtStats *es,
++                 uint64_t *calls, uint64_t *usec,
++                 uint64_t *min, uint64_t *max)
++{
++    *calls = 0; *usec = 0;
++    *min = UINT64_MAX; *max = 0;
++
++    for (int i = 0; i < 5; i++) {
++        *calls += es->slots_5s[i].calls;
++        *usec  += es->slots_5s[i].usec;
++        if (es->slots_5s[i].usec_min < *min)
++            *min = es->slots_5s[i].usec_min;
++        if (es->slots_5s[i].usec_max > *max)
++            *max = es->slots_5s[i].usec_max;
++    }
++    if (*calls == 0) *min = 0;
++}
++
++sds genCommandExtStatsString(commandExtStats *es, sds info) {
++    if (es == NULL) return info;
++
++    uint64_t c5s_calls, c5s_usec, c5s_min, c5s_max;
++    aggregate5s(es, &c5s_calls, &c5s_usec, &c5s_min, &c5s_max);
++    uint64_t c5s_avg = (c5s_calls == 0) ? 0 : c5s_usec / c5s_calls;
++
++    uint64_t cm_calls, cm_usec, cm_min, cm_max, cm_p95, cm_p99;
++    aggregateMinute(es, &cm_calls, &cm_usec, &cm_min, &cm_max, &cm_p95, &cm_p99);
++    uint64_t cm_avg = (cm_calls == 0) ? 0 : cm_usec / cm_calls;
++
++    uint64_t usec_min_alltime = (es->calls_alltime == 0) ? 0 : es->usec_min_alltime;
++    uint64_t p95 = histogramPercentile(&es->hist_alltime, 0.95);
++    uint64_t p99 = histogramPercentile(&es->hist_alltime, 0.99);
++
++    info = sdscatprintf(info,
++        ",usec_min=%llu,usec_max=%llu,usec_p95=%llu,usec_p99=%llu"
++        ",calls_5s=%llu,usec_5s=%llu,usec_min_5s=%llu,usec_avg_5s=%llu,usec_max_5s=%llu"
++        ",calls_minute=%llu,usec_minute=%llu,usec_min_minute=%llu,usec_avg_minute=%llu,usec_max_minute=%llu"
++        ",usec_p95_minute=%llu,usec_p99_minute=%llu",
++        (unsigned long long)usec_min_alltime,
++        (unsigned long long)es->usec_max_alltime,
++        (unsigned long long)p95,
++        (unsigned long long)p99,
++        (unsigned long long)c5s_calls,
++        (unsigned long long)c5s_usec,
++        (unsigned long long)c5s_min,
++        (unsigned long long)c5s_avg,
++        (unsigned long long)c5s_max,
++        (unsigned long long)cm_calls,
++        (unsigned long long)cm_usec,
++        (unsigned long long)cm_min,
++        (unsigned long long)cm_avg,
++        (unsigned long long)cm_max,
++        (unsigned long long)cm_p95,
++        (unsigned long long)cm_p99);
++
++    return info;
++}
++
++void aggregateMinute(commandExtStats *es,
++                     uint64_t *calls, uint64_t *usec,
++                     uint64_t *min, uint64_t *max,
++                     uint64_t *p95, uint64_t *p99)
++{
++    *calls = 0; *usec = 0;
++    *min = UINT64_MAX; *max = 0;
++
++    histogram merged;
++    histogramType t = server.command_latency_histogram_type;
++    merged.type = t;
++    merged.impl = histogram_engines[t].create();
++
++    for (int i = 0; i < 12; i++) {
++        *calls += es->slots_minute[i].calls;
++        *usec  += es->slots_minute[i].usec;
++        if (es->slots_minute[i].usec_min < *min)
++            *min = es->slots_minute[i].usec_min;
++        if (es->slots_minute[i].usec_max > *max)
++            *max = es->slots_minute[i].usec_max;
++        histogramMergeFrom(&merged, &es->slots_minute[i].hist);
++    }
++
++    if (*calls == 0) {
++        *min = 0;
++        *p95 = 0;
++        *p99 = 0;
++    } else {
++        *p95 = histogramPercentile(&merged, 0.95);
++        *p99 = histogramPercentile(&merged, 0.99);
++    }
++
++    histogramDestroy(&merged);
++}
+diff --git a/src/config.c b/src/config.c
+index 691b8a045..b0ef8e8d0 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -126,6 +126,11 @@ configEnum sanitize_dump_payload_enum[] = {
+     {NULL, 0}
+ };
+ 
++configEnum command_latency_histogram_type_enum[] = {
++    {"logbucket", HISTOGRAM_LOG_BUCKET},
++    {NULL, 0}
++};
++
+ /* Output buffer limits presets. */
+ clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
+     {0, 0, 0}, /* normal */
+@@ -2440,6 +2445,7 @@ standardConfig configs[] = {
+     createBoolConfig("disable-thp", NULL, MODIFIABLE_CONFIG, server.disable_thp, 1, NULL, NULL),
+     createBoolConfig("cluster-allow-replica-migration", NULL, MODIFIABLE_CONFIG, server.cluster_allow_replica_migration, 1, NULL, NULL),
+     createBoolConfig("replica-announced", NULL, MODIFIABLE_CONFIG, server.replica_announced, 1, NULL, NULL),
++    createBoolConfig("command-latency-tracking", NULL, MODIFIABLE_CONFIG, server.command_latency_tracking, 0, NULL, NULL),
+ 
+     /* String Configs */
+     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
+@@ -2472,6 +2478,7 @@ standardConfig configs[] = {
+     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
+     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubsub_default, USER_FLAG_ALLCHANNELS, NULL, NULL),
+     createEnumConfig("sanitize-dump-payload", NULL, MODIFIABLE_CONFIG, sanitize_dump_payload_enum, server.sanitize_dump_payload, SANITIZE_DUMP_NO, NULL, NULL),
++    createEnumConfig("command-latency-histogram-type", NULL, MODIFIABLE_CONFIG, command_latency_histogram_type_enum, server.command_latency_histogram_type, HISTOGRAM_LOG_BUCKET, NULL, NULL),
+ 
+     /* Integer configs */
+     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.dbnum, 16, INTEGER_CONFIG, NULL, NULL),
+diff --git a/src/histogram.h b/src/histogram.h
+new file mode 100644
+index 000000000..6c815bb19
+--- /dev/null
++++ b/src/histogram.h
+@@ -0,0 +1,54 @@
++#ifndef __HISTOGRAM_H
++#define __HISTOGRAM_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++typedef enum {
++    HISTOGRAM_LOG_BUCKET = 0,
++    HISTOGRAM_TYPE_COUNT
++} histogramType;
++
++typedef struct histogram {
++    histogramType type;
++    void *impl;
++} histogram;
++
++typedef struct histogramVtable {
++    const char *name;
++    void*    (*create)(void);
++    void     (*destroy)(void *impl);
++    void     (*record)(void *impl, uint64_t usec);
++    uint64_t (*percentile)(void *impl, double pct);
++    void     (*merge_from)(void *dst, void *src);
++    void     (*reset)(void *impl);
++    size_t   (*mem_usage)(void *impl);
++} histogramVtable;
++
++extern histogramVtable histogram_engines[HISTOGRAM_TYPE_COUNT];
++
++static inline void histogramRecord(histogram *h, uint64_t usec) {
++    histogram_engines[h->type].record(h->impl, usec);
++}
++
++static inline uint64_t histogramPercentile(histogram *h, double pct) {
++    return histogram_engines[h->type].percentile(h->impl, pct);
++}
++
++static inline void histogramMergeFrom(histogram *dst, histogram *src) {
++    histogram_engines[dst->type].merge_from(dst->impl, src->impl);
++}
++
++static inline void histogramReset(histogram *h) {
++    histogram_engines[h->type].reset(h->impl);
++}
++
++static inline void histogramDestroy(histogram *h) {
++    histogram_engines[h->type].destroy(h->impl);
++}
++
++static inline size_t histogramMemUsage(histogram *h) {
++    return histogram_engines[h->type].mem_usage(h->impl);
++}
++
++#endif
+diff --git a/src/histogram_logbucket.c b/src/histogram_logbucket.c
+new file mode 100644
+index 000000000..b0462c2f1
+--- /dev/null
++++ b/src/histogram_logbucket.c
+@@ -0,0 +1,79 @@
++#include "server.h"
++#include "histogram.h"
++
++#include <string.h>
++
++#define LOG_BUCKET_COUNT 30
++
++typedef struct {
++    uint64_t counts[LOG_BUCKET_COUNT];
++    uint64_t total_count;
++} logBucketHistogram;
++
++static inline int logBucketIndex(uint64_t usec) {
++    if (usec == 0) return 0;
++    int idx = 63 - __builtin_clzll(usec);
++    if (idx >= LOG_BUCKET_COUNT) idx = LOG_BUCKET_COUNT - 1;
++    return idx;
++}
++
++static void* logBucket_create(void) {
++    logBucketHistogram *h = zcalloc(sizeof(logBucketHistogram));
++    return h;
++}
++
++static void logBucket_destroy(void *impl) {
++    zfree(impl);
++}
++
++static void logBucket_record(void *impl, uint64_t usec) {
++    logBucketHistogram *h = impl;
++    h->counts[logBucketIndex(usec)]++;
++    h->total_count++;
++}
++
++static uint64_t logBucket_percentile(void *impl, double pct) {
++    logBucketHistogram *h = impl;
++    if (h->total_count == 0) return 0;
++    uint64_t threshold = (uint64_t)(h->total_count * pct);
++    if (threshold == 0) threshold = 1;
++    uint64_t cumulative = 0;
++    for (int i = 0; i < LOG_BUCKET_COUNT; i++) {
++        cumulative += h->counts[i];
++        if (cumulative >= threshold) {
++            return (i == 0) ? 1 : (1ULL << i);
++        }
++    }
++    return 1ULL << (LOG_BUCKET_COUNT - 1);
++}
++
++static void logBucket_merge_from(void *dst, void *src) {
++    logBucketHistogram *d = dst, *s = src;
++    for (int i = 0; i < LOG_BUCKET_COUNT; i++)
++        d->counts[i] += s->counts[i];
++    d->total_count += s->total_count;
++}
++
++static void logBucket_reset(void *impl) {
++    logBucketHistogram *h = impl;
++    memset(h->counts, 0, sizeof(h->counts));
++    h->total_count = 0;
++}
++
++static size_t logBucket_mem_usage(void *impl) {
++    UNUSED(impl);
++    return sizeof(logBucketHistogram);
++}
++
++histogramVtable histogram_engines[HISTOGRAM_TYPE_COUNT] = {
++    [HISTOGRAM_LOG_BUCKET] = {
++        .name       = "logbucket",
++        .create     = logBucket_create,
++        .destroy    = logBucket_destroy,
++        .record     = logBucket_record,
++        .percentile = logBucket_percentile,
++        .merge_from = logBucket_merge_from,
++        .reset      = logBucket_reset,
++        .mem_usage  = logBucket_mem_usage,
++    },
++};
+diff --git a/src/server.c b/src/server.c
+index 55562732b..ad1e2ec13 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -2276,6 +2276,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+                           0,
+                           &ei);
+ 
++    cronRotateLatencySlots();
++
+     server.cronloops++;
+     return 1000/server.hz;
+ }
+@@ -2702,6 +2704,15 @@ void initServerConfig(void) {
+     server.loading_process_events_interval_bytes = (1024*1024*2);
+     server.pause_cron = 0;
+ 
++    server.command_latency_tracking = 0;
++    server.command_latency_histogram_type = HISTOGRAM_LOG_BUCKET;
++    server.category_all = NULL;
++    server.category_read = NULL;
++    server.category_write = NULL;
++    server.category_other = NULL;
++    server.last_5s_rotate_time = 0;
++    server.last_minute_rotate_time = 0;
++
+     unsigned int lruclock = getLRUClock();
+     atomicSet(server.lruclock,lruclock);
+     resetServerSaveParams();
+@@ -3203,6 +3214,11 @@ void initServer(void) {
+     server.blocked_last_cron = 0;
+     server.blocking_op_nesting = 0;
+ 
++    server.category_all  = initCommandExtStats();
++    server.category_read = initCommandExtStats();
++    server.category_write = initCommandExtStats();
++    server.category_other = initCommandExtStats();
++
+     if ((server.tls_port || server.tls_replication || server.tls_cluster)
+                 && tlsConfigure(&server.tls_ctx_config) == C_ERR) {
+         serverLog(LL_WARNING, "Failed to configure TLS. Check logs for more info.");
+@@ -3497,9 +3513,14 @@ void resetCommandTableStats(void) {
+         c->calls = 0;
+         c->rejected_calls = 0;
+         c->failed_calls = 0;
++        resetCommandExtStats(c->ext_stats);
+     }
+     dictReleaseIterator(di);
+ 
++    resetCommandExtStats(server.category_all);
++    resetCommandExtStats(server.category_read);
++    resetCommandExtStats(server.category_write);
++    resetCommandExtStats(server.category_other);
+ }
+ 
+ void resetErrorTableStats(void) {
+@@ -3827,6 +3848,7 @@ void call(client *c, int flags) {
+     if (flags & CMD_CALL_STATS) {
+         real_cmd->microseconds += duration;
+         real_cmd->calls++;
++        updateCommandExtLatency(c, duration);
+     }
+ 
+     /* Propagate the command into the AOF and replication link */
+@@ -5327,18 +5349,49 @@ sds genRedisInfoString(const char *section) {
+         struct redisCommand *c;
+         dictEntry *de;
+         dictIterator *di;
++        char *tmpsafe;
++
++        if (server.command_latency_tracking) {
++            commandExtStats *categories[] = {
++                server.category_all,
++                server.category_read,
++                server.category_write,
++                server.category_other,
++            };
++            const char *cat_names[] = {"-", "r", "w", "o"};
++            for (int ci = 0; ci < 4; ci++) {
++                commandExtStats *es = categories[ci];
++                if (!es || es->calls_alltime == 0) continue;
++                info = sdscatprintf(info,
++                    "cmdstat_%s:calls=%llu,usec=%llu,usec_per_call=%.2f"
++                    ",rejected_calls=%lld,failed_calls=%lld",
++                    cat_names[ci],
++                    (unsigned long long)es->calls_alltime,
++                    (unsigned long long)es->usec_alltime,
++                    (es->calls_alltime == 0) ? 0 :
++                        ((float)es->usec_alltime / es->calls_alltime),
++                    0LL, 0LL);
++                info = genCommandExtStatsString(es, info);
++                info = sdscatprintf(info, "\r\n");
++            }
++        }
++
+         di = dictGetSafeIterator(server.commands);
+         while((de = dictNext(di)) != NULL) {
+-            char *tmpsafe;
+             c = (struct redisCommand *) dictGetVal(de);
+             if (!c->calls && !c->failed_calls && !c->rejected_calls)
+                 continue;
+             info = sdscatprintf(info,
+                 "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
+-                ",rejected_calls=%lld,failed_calls=%lld\r\n",
+-                getSafeInfoString(c->name, strlen(c->name), &tmpsafe), c->calls, c->microseconds,
++                ",rejected_calls=%lld,failed_calls=%lld",
++                getSafeInfoString(c->name, strlen(c->name), &tmpsafe),
++                c->calls, c->microseconds,
+                 (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
+                 c->rejected_calls, c->failed_calls);
++            if (server.command_latency_tracking) {
++                info = genCommandExtStatsString(c->ext_stats, info);
++            }
++            info = sdscatprintf(info, "\r\n");
+             if (tmpsafe != NULL) zfree(tmpsafe);
+         }
+         dictReleaseIterator(di);
+diff --git a/src/server.h b/src/server.h
+index 7afd6843e..743b569fb 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -62,6 +62,7 @@ typedef long long ustime_t; /* microsecond time type. */
+ #include "sds.h"     /* Dynamic safe strings */
+ #include "dict.h"    /* Hash tables */
+ #include "adlist.h"  /* Linked lists */
++#include "histogram.h"
+ #include "zmalloc.h" /* total memory usage aware version of malloc/free */
+ #include "anet.h"    /* Networking the easy way */
+ #include "ziplist.h" /* Compact list data structure */
+@@ -1172,6 +1173,8 @@ typedef enum childInfoType {
+     CHILD_INFO_TYPE_MODULE_COW_SIZE
+ } childInfoType;
+ 
++typedef struct commandExtStats commandExtStats;
++
+ struct redisServer {
+     /* General */
+     pid_t pid;                  /* Main process pid. */
+@@ -1638,6 +1641,18 @@ struct redisServer {
+                                 * failover then any replica can be used. */
+     int target_replica_port; /* Failover target port */
+     int failover_state; /* Failover state */
++
++    /* Command latency extended stats */
++    int command_latency_tracking;
++    histogramType command_latency_histogram_type;
++
++    commandExtStats *category_all;
++    commandExtStats *category_read;
++    commandExtStats *category_write;
++    commandExtStats *category_other;
++
++    mstime_t last_5s_rotate_time;
++    mstime_t last_minute_rotate_time;
+ };
+ 
+ #define MAX_KEYS_BUFFER 256
+@@ -1655,6 +1670,38 @@ typedef struct {
+ 
+ typedef void redisCommandProc(client *c);
+ typedef int redisGetKeysProc(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result);
++
++/* ---- Command latency extended statistics ---- */
++
++typedef struct slot5s {
++    uint64_t calls;
++    uint64_t usec;
++    uint64_t usec_min;
++    uint64_t usec_max;
++} slot5s;
++
++typedef struct slotMinute {
++    uint64_t  calls;
++    uint64_t  usec;
++    uint64_t  usec_min;
++    uint64_t  usec_max;
++    histogram hist;
++} slotMinute;
++
++typedef struct commandExtStats {
++    uint64_t  calls_alltime;
++    uint64_t  usec_alltime;
++    uint64_t  usec_min_alltime;
++    uint64_t  usec_max_alltime;
++    histogram hist_alltime;
++
++    int       cur_5s_slot;
++    slot5s    slots_5s[5];
++
++    int         cur_minute_slot;
++    slotMinute  slots_minute[12];
++} commandExtStats;
++
+ struct redisCommand {
+     char *name;
+     redisCommandProc *proc;
+@@ -1674,6 +1721,7 @@ struct redisCommand {
+                    ACLs. A connection is able to execute a given command if
+                    the user associated to the connection has this command
+                    bit set in the bitmap of allowed commands. */
++    commandExtStats *ext_stats; /* Extended latency stats (lazy init) */
+ };
+ 
+ struct redisError {
+@@ -2256,6 +2304,22 @@ int htNeedsResize(dict *dict);
+ void populateCommandTable(void);
+ void resetCommandTableStats(void);
+ void resetErrorTableStats(void);
++
++/* Command latency extended statistics functions */
++commandExtStats* initCommandExtStats(void);
++void freeCommandExtStats(commandExtStats *es);
++void resetCommandExtStats(commandExtStats *es);
++void updateCommandExtLatency(client *c, ustime_t duration);
++int classifyCommandCategory(struct redisCommand *cmd);
++void cronRotateLatencySlots(void);
++void aggregate5s(commandExtStats *es,
++                 uint64_t *calls, uint64_t *usec,
++                 uint64_t *min, uint64_t *max);
++void aggregateMinute(commandExtStats *es,
++                     uint64_t *calls, uint64_t *usec,
++                     uint64_t *min, uint64_t *max,
++                     uint64_t *p95, uint64_t *p99);
++sds genCommandExtStatsString(commandExtStats *es, sds info);
+ void adjustOpenFilesLimit(void);
+ void incrementErrorCount(const char *fullerr, size_t namelen);
+ void closeListeningSockets(int unlink_unix_socket);
+-- 
+2.43.0
+
