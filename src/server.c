@@ -2276,6 +2276,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                           0,
                           &ei);
 
+    cronRotateLatencySlots();
+
     server.cronloops++;
     return 1000/server.hz;
 }
@@ -2701,6 +2703,15 @@ void initServerConfig(void) {
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.loading_process_events_interval_bytes = (1024*1024*2);
     server.pause_cron = 0;
+
+    server.command_latency_tracking = 0;
+    server.command_latency_histogram_type = HISTOGRAM_LOG_BUCKET;
+    server.category_all = NULL;
+    server.category_read = NULL;
+    server.category_write = NULL;
+    server.category_other = NULL;
+    server.last_5s_rotate_time = 0;
+    server.last_minute_rotate_time = 0;
 
     unsigned int lruclock = getLRUClock();
     atomicSet(server.lruclock,lruclock);
@@ -3203,6 +3214,11 @@ void initServer(void) {
     server.blocked_last_cron = 0;
     server.blocking_op_nesting = 0;
 
+    server.category_all  = initCommandExtStats();
+    server.category_read = initCommandExtStats();
+    server.category_write = initCommandExtStats();
+    server.category_other = initCommandExtStats();
+
     if ((server.tls_port || server.tls_replication || server.tls_cluster)
                 && tlsConfigure(&server.tls_ctx_config) == C_ERR) {
         serverLog(LL_WARNING, "Failed to configure TLS. Check logs for more info.");
@@ -3497,9 +3513,14 @@ void resetCommandTableStats(void) {
         c->calls = 0;
         c->rejected_calls = 0;
         c->failed_calls = 0;
+        resetCommandExtStats(c->ext_stats);
     }
     dictReleaseIterator(di);
 
+    resetCommandExtStats(server.category_all);
+    resetCommandExtStats(server.category_read);
+    resetCommandExtStats(server.category_write);
+    resetCommandExtStats(server.category_other);
 }
 
 void resetErrorTableStats(void) {
@@ -3827,6 +3848,7 @@ void call(client *c, int flags) {
     if (flags & CMD_CALL_STATS) {
         real_cmd->microseconds += duration;
         real_cmd->calls++;
+        updateCommandExtLatency(c, duration);
     }
 
     /* Propagate the command into the AOF and replication link */
@@ -5327,18 +5349,49 @@ sds genRedisInfoString(const char *section) {
         struct redisCommand *c;
         dictEntry *de;
         dictIterator *di;
+        char *tmpsafe;
+
+        if (server.command_latency_tracking) {
+            commandExtStats *categories[] = {
+                server.category_all,
+                server.category_read,
+                server.category_write,
+                server.category_other,
+            };
+            const char *cat_names[] = {"-", "r", "w", "o"};
+            for (int ci = 0; ci < 4; ci++) {
+                commandExtStats *es = categories[ci];
+                if (!es || es->calls_alltime == 0) continue;
+                info = sdscatprintf(info,
+                    "cmdstat_%s:calls=%llu,usec=%llu,usec_per_call=%.2f"
+                    ",rejected_calls=%lld,failed_calls=%lld",
+                    cat_names[ci],
+                    (unsigned long long)es->calls_alltime,
+                    (unsigned long long)es->usec_alltime,
+                    (es->calls_alltime == 0) ? 0 :
+                        ((float)es->usec_alltime / es->calls_alltime),
+                    0LL, 0LL);
+                info = genCommandExtStatsString(es, info);
+                info = sdscatprintf(info, "\r\n");
+            }
+        }
+
         di = dictGetSafeIterator(server.commands);
         while((de = dictNext(di)) != NULL) {
-            char *tmpsafe;
             c = (struct redisCommand *) dictGetVal(de);
             if (!c->calls && !c->failed_calls && !c->rejected_calls)
                 continue;
             info = sdscatprintf(info,
                 "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
-                ",rejected_calls=%lld,failed_calls=%lld\r\n",
-                getSafeInfoString(c->name, strlen(c->name), &tmpsafe), c->calls, c->microseconds,
+                ",rejected_calls=%lld,failed_calls=%lld",
+                getSafeInfoString(c->name, strlen(c->name), &tmpsafe),
+                c->calls, c->microseconds,
                 (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
                 c->rejected_calls, c->failed_calls);
+            if (server.command_latency_tracking) {
+                info = genCommandExtStatsString(c->ext_stats, info);
+            }
+            info = sdscatprintf(info, "\r\n");
             if (tmpsafe != NULL) zfree(tmpsafe);
         }
         dictReleaseIterator(di);

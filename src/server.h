@@ -62,6 +62,7 @@ typedef long long ustime_t; /* microsecond time type. */
 #include "sds.h"     /* Dynamic safe strings */
 #include "dict.h"    /* Hash tables */
 #include "adlist.h"  /* Linked lists */
+#include "histogram.h"
 #include "zmalloc.h" /* total memory usage aware version of malloc/free */
 #include "anet.h"    /* Networking the easy way */
 #include "ziplist.h" /* Compact list data structure */
@@ -1172,6 +1173,8 @@ typedef enum childInfoType {
     CHILD_INFO_TYPE_MODULE_COW_SIZE
 } childInfoType;
 
+typedef struct commandExtStats commandExtStats;
+
 struct redisServer {
     /* General */
     pid_t pid;                  /* Main process pid. */
@@ -1638,6 +1641,18 @@ struct redisServer {
                                 * failover then any replica can be used. */
     int target_replica_port; /* Failover target port */
     int failover_state; /* Failover state */
+
+    /* Command latency extended stats */
+    int command_latency_tracking;
+    histogramType command_latency_histogram_type;
+
+    commandExtStats *category_all;
+    commandExtStats *category_read;
+    commandExtStats *category_write;
+    commandExtStats *category_other;
+
+    mstime_t last_5s_rotate_time;
+    mstime_t last_minute_rotate_time;
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -1655,6 +1670,38 @@ typedef struct {
 
 typedef void redisCommandProc(client *c);
 typedef int redisGetKeysProc(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result);
+
+/* ---- Command latency extended statistics ---- */
+
+typedef struct slot5s {
+    uint64_t calls;
+    uint64_t usec;
+    uint64_t usec_min;
+    uint64_t usec_max;
+} slot5s;
+
+typedef struct slotMinute {
+    uint64_t  calls;
+    uint64_t  usec;
+    uint64_t  usec_min;
+    uint64_t  usec_max;
+    histogram hist;
+} slotMinute;
+
+typedef struct commandExtStats {
+    uint64_t  calls_alltime;
+    uint64_t  usec_alltime;
+    uint64_t  usec_min_alltime;
+    uint64_t  usec_max_alltime;
+    histogram hist_alltime;
+
+    int       cur_5s_slot;
+    slot5s    slots_5s[5];
+
+    int         cur_minute_slot;
+    slotMinute  slots_minute[12];
+} commandExtStats;
+
 struct redisCommand {
     char *name;
     redisCommandProc *proc;
@@ -1674,6 +1721,7 @@ struct redisCommand {
                    ACLs. A connection is able to execute a given command if
                    the user associated to the connection has this command
                    bit set in the bitmap of allowed commands. */
+    commandExtStats *ext_stats; /* Extended latency stats (lazy init) */
 };
 
 struct redisError {
@@ -2256,6 +2304,22 @@ int htNeedsResize(dict *dict);
 void populateCommandTable(void);
 void resetCommandTableStats(void);
 void resetErrorTableStats(void);
+
+/* Command latency extended statistics functions */
+commandExtStats* initCommandExtStats(void);
+void freeCommandExtStats(commandExtStats *es);
+void resetCommandExtStats(commandExtStats *es);
+void updateCommandExtLatency(client *c, ustime_t duration);
+int classifyCommandCategory(struct redisCommand *cmd);
+void cronRotateLatencySlots(void);
+void aggregate5s(commandExtStats *es,
+                 uint64_t *calls, uint64_t *usec,
+                 uint64_t *min, uint64_t *max);
+void aggregateMinute(commandExtStats *es,
+                     uint64_t *calls, uint64_t *usec,
+                     uint64_t *min, uint64_t *max,
+                     uint64_t *p95, uint64_t *p99);
+sds genCommandExtStatsString(commandExtStats *es, sds info);
 void adjustOpenFilesLimit(void);
 void incrementErrorCount(const char *fullerr, size_t namelen);
 void closeListeningSockets(int unlink_unix_socket);
