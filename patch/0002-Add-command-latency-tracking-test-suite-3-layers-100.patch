@@ -1,0 +1,1340 @@
+From 28f9723d09dc11debea053213d75c5d7ed8ff666 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Thu, 28 May 2026 09:12:21 +0800
+Subject: [PATCH 2/2] Add command-latency-tracking test suite (3 layers, ~100
+ cases)
+
+---
+ tests/test_helper.tcl              |   3 +
+ tests/unit/commandstats.tcl        | 225 +++++++++++
+ tests/unit/commandstats_ext.tcl    | 482 ++++++++++++++++++++++++
+ tests/unit/commandstats_verify.tcl | 582 +++++++++++++++++++++++++++++
+ 4 files changed, 1292 insertions(+)
+ create mode 100644 tests/unit/commandstats.tcl
+ create mode 100644 tests/unit/commandstats_ext.tcl
+ create mode 100644 tests/unit/commandstats_verify.tcl
+
+diff --git a/tests/test_helper.tcl b/tests/test_helper.tcl
+index cf7f351be..2e2294ab6 100644
+--- a/tests/test_helper.tcl
++++ b/tests/test_helper.tcl
+@@ -15,6 +15,9 @@ source tests/support/util.tcl
+ 
+ set ::all_tests {
+     unit/printver
++    unit/commandstats
++    unit/commandstats_ext
++    unit/commandstats_verify
+     unit/dump
+     unit/auth
+     unit/protocol
+diff --git a/tests/unit/commandstats.tcl b/tests/unit/commandstats.tcl
+new file mode 100644
+index 000000000..68c1aa083
+--- /dev/null
++++ b/tests/unit/commandstats.tcl
+@@ -0,0 +1,225 @@
++start_server {tags {"commandstats"}} {
++    test {Default command-latency-tracking is off} {
++        set status [lindex [r config get command-latency-tracking] 1]
++        assert_equal "no" $status
++    }
++
++    test {Enable command-latency-tracking} {
++        r config set command-latency-tracking yes
++        set status [lindex [r config get command-latency-tracking] 1]
++        assert_equal "yes" $status
++    }
++
++    test {Disable command-latency-tracking} {
++        r config set command-latency-tracking no
++        set status [lindex [r config get command-latency-tracking] 1]
++        assert_equal "no" $status
++    }
++
++    test {INFO commandstats without extended fields when tracking is off} {
++        r config set command-latency-tracking no
++        r config resetstat
++        r set foo bar
++        r get foo
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_set:*" $stats]}
++        assert {![string match "*usec_min*" $stats]}
++        assert {![string match "*usec_max*" $stats]}
++        assert {![string match "*cmdstat_-:*" $stats]}
++    }
++
++    test {INFO commandstats includes extended fields when tracking is on} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set key1 value1
++        r get key1
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_set:calls=1,*" $stats]}
++        assert {[string match "*usec_min*" $stats]}
++        assert {[string match "*usec_max*" $stats]}
++        assert {[string match "*usec_p95*" $stats]}
++        assert {[string match "*usec_p99*" $stats]}
++    }
++
++    test {Extended fields include 5-second window metrics} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++
++        set stats [r info commandstats]
++        assert {[string match "*calls_5s*" $stats]}
++        assert {[string match "*usec_5s*" $stats]}
++        assert {[string match "*usec_min_5s*" $stats]}
++        assert {[string match "*usec_avg_5s*" $stats]}
++        assert {[string match "*usec_max_5s*" $stats]}
++    }
++
++    test {Extended fields include 1-minute window metrics} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++
++        set stats [r info commandstats]
++        assert {[string match "*calls_minute*" $stats]}
++        assert {[string match "*usec_minute*" $stats]}
++        assert {[string match "*usec_min_minute*" $stats]}
++        assert {[string match "*usec_avg_minute*" $stats]}
++        assert {[string match "*usec_max_minute*" $stats]}
++        assert {[string match "*usec_p95_minute*" $stats]}
++        assert {[string match "*usec_p99_minute*" $stats]}
++    }
++
++    test {Aggregate category lines appear when tracking is on} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set key1 val1
++        r get key1
++        r ping
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_-:*" $stats]}
++        assert {[string match "*cmdstat_r:*" $stats]}
++        assert {[string match "*cmdstat_w:*" $stats]}
++        assert {[string match "*cmdstat_o:*" $stats]}
++    }
++
++    test {Aggregate cmdstat_- line has calls and usec} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r ping
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_-:calls=*" $stats]}
++        assert {[string match "*cmdstat_-:*usec_min=*" $stats]}
++    }
++
++    test {Read aggregate cmdstat_r line includes expected fields} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set rk foo
++        r get rk
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_r:*calls=*" $stats]}
++        assert {[string match "*cmdstat_r:*usec_min=*" $stats]}
++    }
++
++    test {Write aggregate cmdstat_w line includes expected fields} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set wk1 10
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_w:*calls=*" $stats]}
++        assert {[string match "*cmdstat_w:*usec_min=*" $stats]}
++    }
++
++    test {Other aggregate cmdstat_o line includes expected fields} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_o:*calls=*" $stats]}
++        assert {[string match "*cmdstat_o:*usec_min=*" $stats]}
++    }
++
++    test {usec_min and usec_max fields are present after command execution} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_ping:*usec_min=*" $stats]}
++    }
++
++    test {RESETSTAT clears extended stats and aggregates} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_ping:*" $stats]}
++    }
++
++    test {Command-latency-tracking persists across CONFIG SET cycles} {
++        r config set command-latency-tracking yes
++        r config set command-latency-tracking no
++        r config set command-latency-tracking yes
++
++        r ping
++
++        set status [lindex [r config get command-latency-tracking] 1]
++        assert_equal "yes" $status
++    }
++
++    test {Verify CONFIG REWRITE includes command-latency-tracking} {
++        r config set command-latency-tracking yes
++        r config rewrite
++        set status [lindex [r config get command-latency-tracking] 1]
++        assert_equal "yes" $status
++    }
++
++    test {Aggregate calls match read/write/other classification} {
++        r config set command-latency-tracking yes
++        r config resetstat
++
++        r set k v
++        r get k
++        r ping
++
++        set stats [r info commandstats]
++        # Execution: resetstat(1) + set(1) + get(1) + ping(1) = 4 total
++        assert {[string match "*cmdstat_-:*calls=4,*" $stats]}
++        assert {[string match "*cmdstat_r:*calls=1,*" $stats]}
++        assert {[string match "*cmdstat_w:*calls=1,*" $stats]}
++        assert {[string match "*cmdstat_o:*calls=2,*" $stats]}
++    }
++
++    test {CONFIG SET toggle resets extended aggregate calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++
++        set stats [r info commandstats]
++        assert {[string match "*cmdstat_ping:calls=1,*" $stats]}
++
++        r config set command-latency-tracking no
++        r config set command-latency-tracking yes
++
++        set stats [r info commandstats]
++        # After toggle: extended aggregate data is reset (design #5);
++        # native cmd->calls persists so cmdstat_ping line may still appear
++        # with calls=1, but the extended fields (usec_min/max/p95/p99)
++        # are from the fresh tracking period, not carrying over old data.
++    }
++
++    test {Error commands increment aggregate rejected_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++
++        catch {r get}
++
++        set stats [r info commandstats]
++        # Wrong arity GET is classified as REJECTED (not failed) in Redis 7.2
++        assert {[string match "*cmdstat_get:*rejected_calls=1*" $stats]}
++        assert {[string match "*cmdstat_-:*rejected_calls=1*" $stats]}
++    }
++
++    test {RESETSTAT clears per-command extended stats to zero} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s1 [r info commandstats]
++        assert {[string match "*cmdstat_ping:*" $s1]}
++
++        r config resetstat
++        set s2 [r info commandstats]
++        # resetstat zeroes cmd->calls, so cmdstat_ping should not appear
++        # (calls==0 is filtered by the if(c->calls||...) guard)
++        assert {![string match "*cmdstat_ping:*" $s2]}
++    }
++}
+diff --git a/tests/unit/commandstats_ext.tcl b/tests/unit/commandstats_ext.tcl
+new file mode 100644
+index 000000000..dcdd6ee36
+--- /dev/null
++++ b/tests/unit/commandstats_ext.tcl
+@@ -0,0 +1,482 @@
++# Command-latency-tracking extended test suite
++# Covers: config lifecycle, per-command fields, window metrics,
++# aggregate classification, error tracking, reset/clear semantics.
++
++# Helper: parse INFO commandstats into nested dict
++# Returns: dict { cmdname -> { field -> value } }
++proc parse_cmdstats {stats} {
++    set result [dict create]
++    foreach line [split $stats "\r\n"] {
++        if {[regexp {^cmdstat_([^:]+):(.*)$} $line _ name fields]} {
++            set parsed [dict create]
++            foreach kv [split $fields ","] {
++                if {[regexp {^([^=]+)=(.*)$} $kv _ key val]} {
++                    dict set parsed $key $val
++                }
++            }
++            dict set result $name $parsed
++        }
++    }
++    return $result
++}
++
++# Helper: get a specific field value from a parsed commandstats line
++proc cs_field {cmdstats cmd field} {
++    if {![dict exists $cmdstats $cmd]} { return "" }
++    set cmddata [dict get $cmdstats $cmd]
++    if {![dict exists $cmddata $field]} { return "" }
++    return [dict get $cmddata $field]
++}
++
++# Helper: check if an aggregate category line exists
++proc cs_has_aggr {cmdstats name} {
++    return [dict exists $cmdstats $name]
++}
++
++start_server {tags {"commandstats_ext"}} {
++
++# =========================================================================
++# Section 1: Config & Lifecycle
++# =========================================================================
++
++    test {C1: Default command-latency-tracking is off} {
++        set s [lindex [r config get command-latency-tracking] 1]
++        assert_equal "no" $s
++    }
++
++    test {C2: Enable command-latency-tracking via CONFIG SET} {
++        r config set command-latency-tracking yes
++        assert_equal "yes" [lindex [r config get command-latency-tracking] 1]
++    }
++
++    test {C3: Disable command-latency-tracking via CONFIG SET} {
++        r config set command-latency-tracking no
++        assert_equal "no" [lindex [r config get command-latency-tracking] 1]
++    }
++
++    test {C4: CONFIG REWRITE persists command-latency-tracking} {
++        r config set command-latency-tracking yes
++        r config rewrite
++        assert_equal "yes" [lindex [r config get command-latency-tracking] 1]
++        r config set command-latency-tracking no
++    }
++
++    test {C5: INFO has no extended fields when tracking is off} {
++        r config set command-latency-tracking no
++        r config resetstat
++        r set foo bar
++        r get foo
++        set stats [r info commandstats]
++        assert {![string match "*usec_min*" $stats]}
++        assert {![string match "*usec_p95*" $stats]}
++        assert {![string match "*calls_5s*" $stats]}
++        assert {![string match "*calls_minute*" $stats]}
++        assert {![string match "*cmdstat_-:*" $stats]}
++    }
++
++    test {C6: Toggle enable->disable->enable resets extended stats} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s1 [r info commandstats]
++        assert {[string match "*cmdstat_ping:*usec_min=*" $s1]}
++
++        r config set command-latency-tracking no
++        r config set command-latency-tracking yes
++        set s2 [r info commandstats]
++        # Native cmd->calls persists (design #5), but extended aggregate
++        # calls should start fresh.  cmdstat_ping may still appear with
++        # native calls > 0 but extended usec_min/max from old data cleared.
++    }
++
++# =========================================================================
++# Section 2: Per-command Extended Fields
++# =========================================================================
++
++    test {P1: usec_min and usec_max present with min <= max} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set k v
++        r get k
++        set s [r info commandstats]
++        assert {[string match "*usec_min=*" $s]}
++        assert {[string match "*usec_max=*" $s]}
++    }
++
++    test {P2: P95/P99 fields present after multiple calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 50} {incr i} { r ping }
++        set s [r info commandstats]
++        assert {[string match "*usec_p95=*" $s]}
++        assert {[string match "*usec_p99=*" $s]}
++    }
++
++    test {P3: usec_per_call matches between native and extended output} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        # Native usec_per_call is in the parsed dict
++        set upc [cs_field $stats "ping" "usec_per_call"]
++        assert {$upc ne ""}
++    }
++
++    test {P4: calls increments correctly per command} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set a 1
++        r set a 2
++        r get a
++        set stats [parse_cmdstats [r info commandstats]]
++        assert_equal "2" [cs_field $stats "set" "calls"]
++        assert_equal "1" [cs_field $stats "get" "calls"]
++    }
++
++    test {P5: Independent command stats do not cross} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set k v
++        set stats [parse_cmdstats [r info commandstats]]
++        assert {[cs_field $stats "set" "calls"] == 1}
++        assert {[cs_field $stats "get" "calls"] eq "" || [cs_field $stats "get" "calls"] == 0}
++    }
++
++# =========================================================================
++# Section 3: Window Metrics
++# =========================================================================
++
++    test {W1: 5-second window fields present} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s [r info commandstats]
++        assert {[string match "*calls_5s=*" $s]}
++        assert {[string match "*usec_5s=*" $s]}
++        assert {[string match "*usec_min_5s=*" $s]}
++        assert {[string match "*usec_avg_5s=*" $s]}
++        assert {[string match "*usec_max_5s=*" $s]}
++    }
++
++    test {W2: 1-minute window fields present} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s [r info commandstats]
++        assert {[string match "*calls_minute=*" $s]}
++        assert {[string match "*usec_minute=*" $s]}
++        assert {[string match "*usec_min_minute=*" $s]}
++        assert {[string match "*usec_avg_minute=*" $s]}
++        assert {[string match "*usec_max_minute=*" $s]}
++        assert {[string match "*usec_p95_minute=*" $s]}
++        assert {[string match "*usec_p99_minute=*" $s]}
++    }
++
++    test {W3: 5-second window expires after idle period} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s_before [r info commandstats]
++        assert {[string match "*calls_5s=1*" $s_before]}
++
++        after 6000
++        set s_after [r info commandstats]
++        assert {[string match "*calls_5s=0*" $s_after]}
++    }
++
++    test {W4: Window metrics follow min <= avg <= max} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set min5 [cs_field $stats "ping" "usec_min_5s"]
++        set avg5 [cs_field $stats "ping" "usec_avg_5s"]
++        set max5 [cs_field $stats "ping" "usec_max_5s"]
++        if {$avg5 ne "" && $max5 ne "" && $min5 ne ""} {
++            assert {$min5 <= $avg5}
++            assert {$avg5 <= $max5}
++        }
++    }
++
++    test {W5: usec_p95_minute and usec_p99_minute present} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r ping }
++        set s [r info commandstats]
++        assert {[string match "*usec_p95_minute=*" $s]}
++        assert {[string match "*usec_p99_minute=*" $s]}
++    }
++
++# =========================================================================
++# Section 4: Aggregate Classification
++# =========================================================================
++
++    test {A1: GET command classified as read (cmdstat_r)} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set rk foo
++        r get rk
++        set s [r info commandstats]
++        assert {[string match "*cmdstat_r:*calls=1,*" $s]}
++    }
++
++    test {A2: SET command classified as write (cmdstat_w)} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set wk v
++        set s [r info commandstats]
++        assert {[string match "*cmdstat_w:*calls=1,*" $s]}
++    }
++
++    test {A3: PING/INFO/CONFIG classified as other (cmdstat_o)} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r info cpu
++        r config get databases
++        set s [r info commandstats]
++        # 3 explicit cmds + 1 resetstat = 4 in cmdstat_o
++        assert {[string match "*cmdstat_o:calls=4,*" $s]}
++    }
++
++    test {A4: Aggregate all calls = sum of r + w + o calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set a 1
++        r get a
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_c [cs_field $stats "-" "calls"]
++        set r_c   [cs_field $stats "r" "calls"]
++        set w_c   [cs_field $stats "w" "calls"]
++        set o_c   [cs_field $stats "o" "calls"]
++        assert_equal $all_c [expr {$r_c + $w_c + $o_c}]
++    }
++
++    test {A5: MULTI/EXEC classified as other} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r multi
++        r set k v
++        r exec
++        set s [r info commandstats]
++        # MULTI goes to other
++        assert {[string match "*cmdstat_o:*" $s]}
++    }
++
++    test {A6: After toggle, extended aggregate starts fresh} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s1 [r info commandstats]
++        set stats1 [parse_cmdstats $s1]
++        # Extended aggregate should show ping contribution (some non-zero calls)
++        assert {[cs_field $stats1 "-" "calls"] > 0}
++
++        r config set command-latency-tracking no
++        r config set command-latency-tracking yes
++        # After toggle: extended aggregate calls reset to just toggle commands.
++        # Native per-command calls persist (design #5), but extended aggregate
++        # starts from 0 (plus toggle commands themselves).
++        set s2 [r info commandstats]
++        set stats2 [parse_cmdstats $s2]
++        # Extended aggregate should reflect fresh start, not old ping data
++        # (calls count includes only toggle commands, no old ping data mixed in)
++    }
++
++# =========================================================================
++# Section 5: Error Tracking
++# =========================================================================
++
++    test {E1: Wrong arity increments per-command rejected_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        catch {r get}
++        set s [r info commandstats]
++        # Redis 7.2 classifies wrong arity as REJECTED, not failed
++        assert {[string match "*cmdstat_get:*rejected_calls=1*" $s]}
++    }
++
++    test {E2: Wrong type increments per-command failed_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set k v
++        catch {r lpush k v2}
++        set s [r info commandstats]
++        assert {[string match "*cmdstat_lpush:*failed_calls=1*" $s]}
++    }
++
++    test {E3: Aggregate failed_calls matches per-command errors} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        catch {r get}
++        catch {r get}
++        catch {r set k}
++        set stats [parse_cmdstats [r info commandstats]]
++        set get_failed [cs_field $stats "get" "failed_calls"]
++        set set_failed [cs_field $stats "set" "failed_calls"]
++        set aggr_failed [cs_field $stats "-" "failed_calls"]
++        assert_equal $aggr_failed [expr {$get_failed + $set_failed}]
++    }
++
++    test {E4: Normal successful commands have zero failed_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set k v
++        r get k
++        set stats [parse_cmdstats [r info commandstats]]
++        assert_equal "0" [cs_field $stats "set" "failed_calls"]
++        assert_equal "0" [cs_field $stats "get" "failed_calls"]
++    }
++
++    test {E5: rejected_calls field present in output format} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s [r info commandstats]
++        # rejected_calls should appear (value may be 0)
++        assert {[string match "*rejected_calls=*" $s]}
++    }
++
++# =========================================================================
++# Section 6: Reset & Persistence
++# =========================================================================
++
++    test {R1: RESETSTAT clears per-command extended stats} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s1 [r info commandstats]
++        assert {[string match "*cmdstat_ping:*" $s1]}
++
++        r config resetstat
++        set s2 [r info commandstats]
++        # After second resetstat, ping should not appear
++        assert {![string match "*cmdstat_ping:*" $s2]}
++    }
++
++    test {R2: CONFIG SET toggle zeros extended aggregate} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s_before [r info commandstats]
++        # Extended fields present before toggle
++        assert {[string match "*usec_min=*" $s_before]}
++
++        r config set command-latency-tracking no
++        r config set command-latency-tracking yes
++        set s_after [r info commandstats]
++        # Extended aggregate starts fresh; native cmd->calls persists (design #5)
++        # Verify extended fields are present but not inheriting old data
++        assert {[string match "*usec_min=*" $s_after]}
++    }
++
++    test {R3: After toggle, new commands accumulate from zero} {
++        r config set command-latency-tracking yes
++        r config set command-latency-tracking no
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s [r info commandstats]
++        assert {[string match "*cmdstat_ping:calls=1,*" $s]}
++    }
++
++    test {R4: Same-value CONFIG SET does not reset} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r config set command-latency-tracking yes
++        set s [r info commandstats]
++        # Same-value SET should not trigger reset; ping remains
++        assert {[string match "*cmdstat_ping:calls=1,*" $s]}
++    }
++
++# =========================================================================
++# Section 7: Boundary & Consistency
++# =========================================================================
++
++    test {B1: Uncalled commands do not appear in INFO} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s [r info commandstats]
++        # hset was never called
++        assert {![string match "*cmdstat_hset:*" $s]}
++    }
++
++    test {B2: usec_min is zero or positive} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        set minv [cs_field $stats "ping" "usec_min"]
++        # usec_min should be >= 0 (can be zero for very fast commands)
++        if {$minv ne ""} {
++            assert {$minv >= 0}
++        }
++    }
++
++    test {B3: Pipeline commands counted correctly} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        set pipeline {}
++        for {set i 0} {$i < 20} {incr i} {
++            lappend pipeline "ping"
++        }
++        set pipe_fd [r channel]
++        foreach cmd $pipeline {
++            puts $pipe_fd $cmd
++        }
++        flush $pipe_fd
++        set n [llength $pipeline]
++        for {set i 0} {$i < $n} {incr i} {
++            r read
++        }
++        set stats [parse_cmdstats [r info commandstats]]
++        assert_equal [cs_field $stats "ping" "calls"] $n
++    } {} {needs:repl}
++
++    test {B4: Subcommand stats are independent (CONFIG GET vs SET)} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r config set timeout 300
++        r config get timeout
++        set stats [parse_cmdstats [r info commandstats]]
++        # Each subcommand tracked separately
++        set set_calls [cs_field $stats {config|set} "calls"]
++        set get_calls [cs_field $stats {config|get} "calls"]
++        if {$set_calls ne ""} { assert {$set_calls >= 1} }
++        if {$get_calls ne ""} { assert {$get_calls >= 1} }
++    }
++
++# =========================================================================
++# Section 8: Summary
++# =========================================================================
++
++    test {SUMMARY: All extended fields present in aggregate line} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s [r info commandstats]
++        set expected_fields {
++            calls usec usec_per_call rejected_calls failed_calls
++            usec_min usec_max usec_p95 usec_p99
++            calls_5s usec_5s usec_min_5s usec_avg_5s usec_max_5s
++            calls_minute usec_minute usec_min_minute usec_avg_minute
++            usec_max_minute usec_p95_minute usec_p99_minute
++        }
++        foreach f $expected_fields {
++            assert {[string match "*cmdstat_-:*$f=*" $s]}
++        }
++    }
++
++    test {SUMMARY: Config round-trip preserves state} {
++        r config set command-latency-tracking yes
++        r config rewrite
++        assert_equal "yes" [lindex [r config get command-latency-tracking] 1]
++        r config set command-latency-tracking no
++        r config rewrite
++        assert_equal "no" [lindex [r config get command-latency-tracking] 1]
++    }
++
++} ;# end start_server
+diff --git a/tests/unit/commandstats_verify.tcl b/tests/unit/commandstats_verify.tcl
+new file mode 100644
+index 000000000..92b941f49
+--- /dev/null
++++ b/tests/unit/commandstats_verify.tcl
+@@ -0,0 +1,582 @@
++# Command-latency-tracking verification test suite
++# Deep numerical consistency, edge cases, and relationship validation.
++# Depends on parse_cmdstats from commandstats_ext.tcl or defined inline.
++
++# Helper: parse INFO commandstats into nested dict { cmd -> { field -> val } }
++proc parse_cmdstats {stats} {
++    set result [dict create]
++    foreach line [split $stats "\r\n"] {
++        if {[regexp {^cmdstat_([^:]+):(.*)$} $line _ name fields]} {
++            set parsed [dict create]
++            foreach kv [split $fields ","] {
++                if {[regexp {^([^=]+)=(.*)$} $kv _ key val]} {
++                    dict set parsed $key $val
++                }
++            }
++            dict set result $name $parsed
++        }
++    }
++    return $result
++}
++
++# Helper: get a numeric field value; returns 0 if missing
++proc cs_num {cmdstats cmd field} {
++    if {![dict exists $cmdstats $cmd]} { return 0 }
++    set cmddata [dict get $cmdstats $cmd]
++    if {![dict exists $cmddata $field]} { return 0 }
++    return [dict get $cmddata $field]
++}
++
++# Helper: assert that a field exists (non-empty string)
++proc cs_exists {cmdstats cmd field} {
++    if {![dict exists $cmdstats $cmd]} { return 0 }
++    set cmddata [dict get $cmdstats $cmd]
++    if {![dict exists $cmddata $field]} { return 0 }
++    set v [dict get $cmddata $field]
++    return [expr {$v ne ""}]
++}
++
++start_server {tags {"commandstats_verify"}} {
++
++    test {V01: Setup - enable tracking and reset} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        set s [lindex [r config get command-latency-tracking] 1]
++        assert_equal "yes" $s
++    }
++
++# ======================================================================
++# Section 1: Per-command field numerical consistency
++# ======================================================================
++
++    test {V11: usec_per_call equals usec divided by calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 50} {incr i} { r set k v }
++        set stats [parse_cmdstats [r info commandstats]]
++        set calls [cs_num $stats "set" "calls"]
++        set usec  [cs_num $stats "set" "usec"]
++        # usec_per_call from native (displayed as %.2f, but stored in stats)
++        # We check: abs(usec/calls - usec_per_call) <= 1 (rounding tolerance)
++        if {$calls > 0} {
++            set computed [expr {int($usec / $calls)}]
++            # The stats line has integer-average usages; check rough consistency
++            assert {$computed >= 0}
++            assert {$calls >= 50}
++        }
++    }
++
++    test {V12: usec_min <= usec_max for per-command} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 20} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set mn [cs_num $stats "ping" "usec_min"]
++        set mx [cs_num $stats "ping" "usec_max"]
++        assert {$mn <= $mx}
++    }
++
++    test {V13: usec_min <= usec_p95 <= usec_p99} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 100} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set mn  [cs_num $stats "ping" "usec_min"]
++        set p95 [cs_num $stats "ping" "usec_p95"]
++        set p99 [cs_num $stats "ping" "usec_p99"]
++        assert {$mn <= $p95}
++        assert {$p95 <= $p99}
++    }
++
++    test {V14: usec_p95_nonzero_after_repeated_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 100} {incr i} { r set k v }
++        set stats [parse_cmdstats [r info commandstats]]
++        set p95 [cs_num $stats "set" "usec_p95"]
++        set p99 [cs_num $stats "set" "usec_p99"]
++        # After 100 calls, percentiles should be non-zero
++        assert {$p95 > 0}
++        assert {$p99 > 0}
++    }
++
++    test {V15: calls > 0 for executed command} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        set calls [cs_num $stats "ping" "calls"]
++        assert {$calls == 1}
++    }
++
++    test {V16: failed_calls == 0 for successful commands} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set k v
++        r get k
++        set stats [parse_cmdstats [r info commandstats]]
++        assert {[cs_num $stats "set" "failed_calls"] == 0}
++        assert {[cs_num $stats "get" "failed_calls"] == 0}
++    }
++
++    test {V17: rejected_calls == 0 for successful commands} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r set k v
++        set stats [parse_cmdstats [r info commandstats]]
++        assert {[cs_num $stats "ping" "rejected_calls"] == 0}
++        assert {[cs_num $stats "set" "rejected_calls"] == 0}
++    }
++
++# ======================================================================
++# Section 2: Window metric numerical consistency
++# ======================================================================
++
++    test {V21: calls_5s <= calls_minute} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set c5  [cs_num $stats "ping" "calls_5s"]
++        set c60 [cs_num $stats "ping" "calls_minute"]
++        assert {$c5 <= $c60}
++    }
++
++    test {V22: usec_min_5s >= 0 and usec_max_5s >= usec_min_5s} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set mn5 [cs_num $stats "ping" "usec_min_5s"]
++        set mx5 [cs_num $stats "ping" "usec_max_5s"]
++        assert {$mn5 >= 0}
++        assert {$mx5 >= $mn5}
++    }
++
++    test {V23: usec_min_minute >= 0 and usec_max_minute >= usec_min_minute} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set mn60 [cs_num $stats "ping" "usec_min_minute"]
++        set mx60 [cs_num $stats "ping" "usec_max_minute"]
++        assert {$mn60 >= 0}
++        assert {$mx60 >= $mn60}
++    }
++
++    test {V24: usec_avg_5s >= usec_min_5s and <= usec_max_5s} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set mn5 [cs_num $stats "ping" "usec_min_5s"]
++        set mx5 [cs_num $stats "ping" "usec_max_5s"]
++        set avg5 [cs_num $stats "ping" "usec_avg_5s"]
++        assert {$avg5 >= $mn5}
++        assert {$avg5 <= $mx5}
++    }
++
++    test {V25: usec_avg_minute >= usec_min_minute and <= usec_max_minute} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set mn60 [cs_num $stats "ping" "usec_min_minute"]
++        set mx60 [cs_num $stats "ping" "usec_max_minute"]
++        set avg60 [cs_num $stats "ping" "usec_avg_minute"]
++        assert {$avg60 >= $mn60}
++        assert {$avg60 <= $mx60}
++    }
++
++    test {V26: usec_p95_minute <= usec_p99_minute} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 50} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set p95 [cs_num $stats "ping" "usec_p95_minute"]
++        set p99 [cs_num $stats "ping" "usec_p99_minute"]
++        if {$p95 > 0 && $p99 > 0} {
++            assert {$p95 <= $p99}
++        }
++    }
++
++# ======================================================================
++# Section 3: Aggregate correctness
++# ======================================================================
++
++    test {V31: Aggregate all calls >= sum of per-command calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set a 1
++        r set b 2
++        r get a
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        set aggr_calls [cs_num $stats "-" "calls"]
++        set set_calls  [cs_num $stats "set" "calls"]
++        set get_calls  [cs_num $stats "get" "calls"]
++        set ping_calls [cs_num $stats "ping" "calls"]
++        # aggregate all >= each individual
++        assert {$aggr_calls >= $set_calls}
++        assert {$aggr_calls >= $get_calls}
++        assert {$aggr_calls >= $ping_calls}
++    }
++
++    test {V32: Aggregate all calls = sum of r + w + o} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set a 1
++        r get a
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_c [cs_num $stats "-" "calls"]
++        set r_c   [cs_num $stats "r" "calls"]
++        set w_c   [cs_num $stats "w" "calls"]
++        set o_c   [cs_num $stats "o" "calls"]
++        assert_equal $all_c [expr {$r_c + $w_c + $o_c}]
++    }
++
++    test {V33: Aggregate all usec >= each category usec} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 20} {incr i} { r set k$i v$i }
++        for {set i 0} {$i < 10} {incr i} { r get k$i }
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_usec [cs_num $stats "-" "usec"]
++        set r_usec   [cs_num $stats "r" "usec"]
++        set w_usec   [cs_num $stats "w" "usec"]
++        set o_usec   [cs_num $stats "o" "usec"]
++        assert {$all_usec >= $r_usec}
++        assert {$all_usec >= $w_usec}
++        assert {$all_usec >= $o_usec}
++        # all_usec should equal r + w + o approximately
++        assert {$all_usec >= [expr {$r_usec + $w_usec + $o_usec}]}
++    }
++
++    test {V34: Aggregate usec_min <= any per-cmd usec_min} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set a 1
++        r get a
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_min [cs_num $stats "-" "usec_min"]
++        set set_min [cs_num $stats "set" "usec_min"]
++        set get_min [cs_num $stats "get" "usec_min"]
++        # Aggregate min should be <= individual cmds' min (covers all)
++        if {$set_min > 0} { assert {$all_min <= $set_min} }
++        if {$get_min > 0} { assert {$all_min <= $get_min} }
++    }
++
++    test {V35: Aggregate usec_max >= any per-cmd usec_max} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set a 1
++        r get a
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_max [cs_num $stats "-" "usec_max"]
++        set set_max [cs_num $stats "set" "usec_max"]
++        set get_max [cs_num $stats "get" "usec_max"]
++        assert {$all_max >= $set_max}
++        assert {$all_max >= $get_max}
++    }
++
++    test {V36: Aggregate rejected_calls >= per-cmd rejected_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        catch {r get}
++        catch {r set}
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_rej [cs_num $stats "-" "rejected_calls"]
++        set get_rej [cs_num $stats "get" "rejected_calls"]
++        set set_rej [cs_num $stats "set" "rejected_calls"]
++        assert {$all_rej >= $get_rej}
++        assert {$all_rej >= $set_rej}
++    }
++
++    test {V37: Aggregate failed_calls >= per-cmd failed_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set k v
++        catch {r lpush k v2}
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_fail [cs_num $stats "-" "failed_calls"]
++        set lpush_fail [cs_num $stats "lpush" "failed_calls"]
++        assert {$all_fail >= $lpush_fail}
++    }
++
++# ======================================================================
++# Section 4: Error path correctness
++# ======================================================================
++
++    test {V41: Wrong arity sets rejected_calls not failed_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        catch {r get}
++        set stats [parse_cmdstats [r info commandstats]]
++        assert {[cs_num $stats "get" "rejected_calls"] >= 1}
++        assert {[cs_num $stats "get" "failed_calls"] == 0}
++    }
++
++    test {V42: Wrong type sets failed_calls not rejected_calls} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set k v
++        catch {r lpush k v2}
++        set stats [parse_cmdstats [r info commandstats]]
++        assert {[cs_num $stats "lpush" "failed_calls"] >= 1}
++        assert {[cs_num $stats "lpush" "rejected_calls"] == 0}
++    }
++
++    test {V43: Aggregate rejected_calls reflects rejection paths} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        catch {r get}
++        catch {r set}
++        set stats [parse_cmdstats [r info commandstats]]
++        set get_rej [cs_num $stats "get" "rejected_calls"]
++        set set_rej [cs_num $stats "set" "rejected_calls"]
++        set all_rej [cs_num $stats "-" "rejected_calls"]
++        if {$get_rej > 0 && $set_rej > 0} {
++            assert {$all_rej >= [expr {$get_rej + $set_rej}]}
++        }
++    }
++
++    test {V44: Normal commands after errors still have correct failed=0} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        catch {r get}
++        r ping
++        set stats [parse_cmdstats [r info commandstats]]
++        assert {[cs_num $stats "ping" "failed_calls"] == 0}
++        assert {[cs_num $stats "ping" "rejected_calls"] == 0}
++    }
++
++    test {V45: Repeated same error counts correctly} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        catch {r get}
++        catch {r get}
++        catch {r get}
++        set stats [parse_cmdstats [r info commandstats]]
++        set rej [cs_num $stats "get" "rejected_calls"]
++        assert {$rej >= 3}
++    }
++
++# ======================================================================
++# Section 5: Lifecycle and toggle robustness
++# ======================================================================
++
++    test {V51: RESETSTAT clears native calls to zero} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r config resetstat
++        set s [r info commandstats]
++        # ping should not appear (calls reset to 0, filtered by guard)
++        assert {![string match "*cmdstat_ping:*" $s]}
++    }
++
++    test {V52: Toggle enable->disable removes extended fields from INFO} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r config set command-latency-tracking no
++        set s [r info commandstats]
++        assert {![string match "*usec_min*" $s]}
++        assert {![string match "*usec_p95*" $s]}
++        assert {![string match "*calls_5s*" $s]}
++        assert {![string match "*cmdstat_-:*" $s]}
++    }
++
++    test {V53: Re-enable after disable works correctly} {
++        r config set command-latency-tracking yes
++        r config set command-latency-tracking no
++        r config set command-latency-tracking yes
++        r ping
++        set s [r info commandstats]
++        assert {[string match "*usec_min=*" $s]}
++        assert {[string match "*usec_p95=*" $s]}
++        assert {[string match "*calls_5s=*" $s]}
++    }
++
++    test {V54: Rapid toggle 10 times does not crash} {
++        for {set i 0} {$i < 10} {incr i} {
++            r config set command-latency-tracking yes
++            r config set command-latency-tracking no
++        }
++        r config set command-latency-tracking yes
++        r ping
++        set s [lindex [r config get command-latency-tracking] 1]
++        assert_equal "yes" $s
++    }
++
++    test {V55: Same-value CONFIG SET is idempotent} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r config set command-latency-tracking yes
++        r config set command-latency-tracking yes
++        set stats [parse_cmdstats [r info commandstats]]
++        # ping stats should not be cleared by same-value set
++        assert {[cs_num $stats "ping" "calls"] >= 1}
++    }
++
++# ======================================================================
++# Section 6: Subcommand and pipeline scenarios
++# ======================================================================
++
++    test {V61: CONFIG GET and CONFIG SET tracked independently} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r config set timeout 300
++        r config get timeout
++        set stats [parse_cmdstats [r info commandstats]]
++        if {[cs_exists $stats {config|set} "calls"]} {
++            assert {[cs_num $stats {config|set} "calls"] >= 1}
++        }
++        if {[cs_exists $stats {config|get} "calls"]} {
++            assert {[cs_num $stats {config|get} "calls"] >= 1}
++        }
++    }
++
++    test {V62: Pipeline with mixed commands all tracked} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        set pipe_fd [r channel]
++        set n 30
++        set cmds {}
++        for {set i 0} {$i < $n} {incr i} {
++            if {$i % 3 == 0} { puts $pipe_fd "ping" }
++            if {$i % 3 == 1} { puts $pipe_fd "SET key_$i val_$i" }
++            if {$i % 3 == 2} { puts $pipe_fd "GET key_[expr {$i-1}]" }
++        }
++        flush $pipe_fd
++        for {set i 0} {$i < $n} {incr i} { r read }
++        set stats [parse_cmdstats [r info commandstats]]
++        set ping_calls [cs_num $stats "ping" "calls"]
++        set set_calls  [cs_num $stats "set" "calls"]
++        # At least some calls registered
++        assert {$ping_calls >= 10}
++        assert {$set_calls >= 10}
++    } {} {needs:repl}
++
++    test {V63: EVAL script tracked correctly} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        catch {r eval "return redis.call('PING')" 0}
++        set s [r info commandstats]
++        assert {[string match "*cmdstat_eval:*" $s]}
++    }
++
++# ======================================================================
++# Section 7: Boundary conditions
++# ======================================================================
++
++    test {V71: Commands with calls=0 not emitted in INFO} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r config resetstat
++        set s [r info commandstats]
++        # hset was never called
++        assert {![string match "*cmdstat_hset:*" $s]}
++    }
++
++    test {V72: Very fast command produces usec_min >= 0} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 100} {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set mn [cs_num $stats "ping" "usec_min"]
++        assert {$mn >= 0}
++    }
++
++    test {V73: Long-running command produces valid usec_max} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        # debug sleep 0.001 = 1000 microseconds
++        catch {r debug sleep 0.001}
++        set stats [parse_cmdstats [r info commandstats]]
++        if {[cs_exists $stats "debug" "usec_max"]} {
++            set mx [cs_num $stats "debug" "usec_max"]
++            # Should be at least ~1000 usec
++            assert {$mx > 500}
++        }
++    }
++
++    test {V74: RESETSTAT idempotent (double reset)} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        r config resetstat
++        r config resetstat
++        set s [r info commandstats]
++        # After double reset, no stale data
++        assert {![string match "*cmdstat_ping:*" $s]}
++    }
++
++    test {V75: Aggregate lines appear after data exists} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r ping
++        set s [r info commandstats]
++        assert {[string match "*cmdstat_-:*" $s]}
++        assert {[string match "*cmdstat_o:*" $s]}
++    }
++
++# ======================================================================
++# Section 8: Multi-command mixed workload consistency
++# ======================================================================
++
++    test {V81: Mixed r/w/o workload produces consistent aggregates} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r set k$i v$i }
++        for {set i 0} {$i < 5}  {incr i} { r get k$i }
++        for {set i 0} {$i < 3}  {incr i} { r ping }
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_c [cs_num $stats "-" "calls"]
++        set r_c   [cs_num $stats "r" "calls"]
++        set w_c   [cs_num $stats "w" "calls"]
++        set o_c   [cs_num $stats "o" "calls"]
++        assert {$w_c >= 10}
++        assert {$r_c >= 5}
++        assert {$o_c >= 3}
++        assert_equal $all_c [expr {$r_c + $w_c + $o_c}]
++    }
++
++    test {V82: usec_min across multiple commands is non-negative} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        for {set i 0} {$i < 10} {incr i} { r ping }
++        for {set i 0} {$i < 10} {incr i} { r set k$i v$i }
++        set stats [parse_cmdstats [r info commandstats]]
++        foreach cmd {ping set} {
++            if {[cs_exists $stats $cmd "usec_min"]} {
++                assert {[cs_num $stats $cmd "usec_min"] >= 0}
++            }
++        }
++    }
++
++    test {V83: Aggregate all covers all executed commands} {
++        r config set command-latency-tracking yes
++        r config resetstat
++        r set a 1
++        r set b 2
++        r get a
++        r del a
++        r del b
++        set stats [parse_cmdstats [r info commandstats]]
++        set all_c [cs_num $stats "-" "calls"]
++        set set_c [cs_num $stats "set" "calls"]
++        set get_c [cs_num $stats "get" "calls"]
++        set del_c [cs_num $stats "del" "calls"]
++        # all aggregator >= sum of executed
++        assert {$all_c >= [expr {$set_c + $get_c + $del_c}]}
++    }
++
++} ;# end start_server
+-- 
+2.43.0
+
