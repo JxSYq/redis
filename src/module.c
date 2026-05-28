@@ -1326,6 +1326,10 @@ RedisModuleCommand *moduleCreateCommandProxy(struct RedisModule *module, sds dec
     cp->rediscmd->calls = 0;
     cp->rediscmd->rejected_calls = 0;
     cp->rediscmd->failed_calls = 0;
+    /* Zero-initialize extended command latency tracking fields so
+     * cleanup paths (module unload, CONFIG SET, etc.) never encounter
+     * uninitialized histogram pointers. */
+    initCommandExtendedTracking(cp->rediscmd);
     return cp;
 }
 
@@ -12122,6 +12126,9 @@ void moduleUnregisterCommands(struct RedisModule *module) {
 
         serverAssert(dictDelete(server.commands, cmd->fullname) == DICT_OK);
         serverAssert(dictDelete(server.orig_commands, cmd->fullname) == DICT_OK);
+        /* Release extended tracking histograms (including nested subcommands)
+         * before freeing command-owned fields. */
+        resetCommandExtendedTrackingRecursive(cmd);
         sdsfree((sds)cmd->declared_name);
         sdsfree(cmd->fullname);
         zfree(cmd);

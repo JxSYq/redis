@@ -680,6 +680,9 @@ typedef enum {
                                         * Value quantization within the range will thus be no larger than 1/100th (or 1%) of any value.
                                         * The total size per histogram should sit around 40 KiB Bytes. */
 
+/* Extended command latency tracking -- see cmd_latency_ext.h */
+#include "cmd_latency_ext.h"
+
 /* Busy module flags, see busy_module_yield_flags */
 #define BUSY_MODULE_YIELD_NONE (0)
 #define BUSY_MODULE_YIELD_EVENTS (1<<0)
@@ -1746,6 +1749,13 @@ struct redisServer {
     int latency_tracking_enabled;   /* 1 if extended latency tracking is enabled, 0 otherwise. */
     double *latency_tracking_info_percentiles; /* Extended latency tracking info output percentile list configuration. */
     int latency_tracking_info_percentiles_len;
+    /* Extended command-level latency tracking (separate from latency_tracking_enabled). */
+    int command_latency_tracking_enabled; /* 1 if enabled (default 0). */
+    int command_latency_tracking_prev_enabled; /* tracks last applied value, -1 = uninit */
+    commandLatencyAggregate cmd_latency_aggr_all;   /* cmdstat_-: all commands */
+    commandLatencyAggregate cmd_latency_aggr_read;  /* cmdstat_r: CMD_READONLY */
+    commandLatencyAggregate cmd_latency_aggr_write; /* cmdstat_w: write commands */
+    commandLatencyAggregate cmd_latency_aggr_other; /* cmdstat_o: admin/management */
     /* AOF persistence */
     int aof_enabled;                /* AOF configuration */
     int aof_state;                  /* AOF_(ON|OFF|WAIT_REWRITE) */
@@ -2362,6 +2372,11 @@ struct redisCommand {
                              * (not the fullname), and the value is the redisCommand structure pointer. */
     struct redisCommand *parent;
     struct RedisModuleCommand *module_cmd; /* A pointer to the module command data (NULL if native command) */
+
+    /* Extended command latency tracking (command-latency-tracking config).
+     * All fields packed into commandLatencyExtData so only ONE field is
+     * added to struct redisCommand -- simplifies porting to Redis 4/5/6. */
+    commandLatencyExtData latency_ext;
 };
 
 struct redisError {
