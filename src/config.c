@@ -214,6 +214,10 @@ void loadServerConfigFromString(char *config) {
             }
         } else if (!strcasecmp(argv[0],"protected-mode") && argc == 2) {
             if ((server.protected_mode = yesnotoi(argv[1])) == -1) {
+        } else if (!strcasecmp(argv[0],"command-latency-tracking") && argc == 2) {
+            if ((server.command_latency_tracking_enabled = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"port") && argc == 2) {
@@ -969,6 +973,21 @@ void configSetCommand(client *c) {
                 return;
             }
         }
+    } config_set_bool_field("command-latency-tracking", server.command_latency_tracking_enabled) {
+        if (server.command_latency_tracking_prev_enabled != server.command_latency_tracking_enabled
+            && server.command_latency_tracking_prev_enabled != -1) {
+            /* value changed: reset extended tracking */
+            dictIterator *di = dictGetSafeIterator(server.commands);
+            dictEntry *de;
+            while ((de = dictNext(di)) != NULL)
+                resetCommandExtendedTrackingRecursive(dictGetVal(de));
+            dictReleaseIterator(di);
+            resetCommandLatencyAggregate(&server.cmd_latency_aggr_all);
+            resetCommandLatencyAggregate(&server.cmd_latency_aggr_read);
+            resetCommandLatencyAggregate(&server.cmd_latency_aggr_write);
+            resetCommandLatencyAggregate(&server.cmd_latency_aggr_other);
+        }
+        server.command_latency_tracking_prev_enabled = server.command_latency_tracking_enabled;
     } config_set_special_field("save") {
         int vlen, j;
         sds *v = sdssplitlen(o->ptr,sdslen(o->ptr)," ",1,&vlen);
@@ -1426,6 +1445,7 @@ void configGetCommand(client *c) {
             server.cluster_slave_no_failover);
     config_get_bool_field("no-appendfsync-on-rewrite",
             server.aof_no_fsync_on_rewrite);
+    config_get_bool_field("command-latency-tracking", server.command_latency_tracking_enabled);
     config_get_bool_field("slave-serve-stale-data",
             server.repl_serve_stale_data);
     config_get_bool_field("replica-serve-stale-data",
@@ -2145,6 +2165,7 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"stop-writes-on-bgsave-error",server.stop_writes_on_bgsave_err,CONFIG_DEFAULT_STOP_WRITES_ON_BGSAVE_ERROR);
     rewriteConfigYesNoOption(state,"rdbcompression",server.rdb_compression,CONFIG_DEFAULT_RDB_COMPRESSION);
     rewriteConfigYesNoOption(state,"rdbchecksum",server.rdb_checksum,CONFIG_DEFAULT_RDB_CHECKSUM);
+    rewriteConfigYesNoOption(state,"command-latency-tracking",server.command_latency_tracking_enabled,0);
     rewriteConfigStringOption(state,"dbfilename",server.rdb_filename,CONFIG_DEFAULT_RDB_FILENAME);
     rewriteConfigDirOption(state);
     rewriteConfigSlaveofOption(state,"replicaof");
