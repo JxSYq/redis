@@ -1,0 +1,156 @@
+From 36261afd0f438cfad0c3a2757bd3eb2d95e13dd2 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Thu, 28 May 2026 09:13:23 +0800
+Subject: [PATCH 3/4] [Port dev_7#2-4] Wire cmd-latency-tracking into
+ server/config/blocked/module with fixes for Redis 6
+
+---
+ src/blocked.c |  2 ++
+ src/config.c  |  6 ++++++
+ src/module.c  |  2 ++
+ src/server.c  | 28 +++++++++++++++++++++++++++-
+ 4 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/blocked.c b/src/blocked.c
+index 2fc2d298d..1b6396580 100644
+--- a/src/blocked.c
++++ b/src/blocked.c
+@@ -111,6 +111,8 @@ void blockClient(client *c, int btype) {
+ void updateStatsOnUnblock(client *c, long blocked_us, long reply_us){
+     const ustime_t total_cmd_duration = c->duration + blocked_us + reply_us;
+     c->lastcmd->microseconds += total_cmd_duration;
++    CMD_LATENCY_STATS_UPDATE(c->lastcmd, total_cmd_duration);
++    CMD_LATENCY_STATS_UPDATE(c->lastcmd, total_cmd_duration);
+ 
+     /* Log the command into the Slow log if needed. */
+     slowlogPushCurrentCommand(c, c->lastcmd, total_cmd_duration);
+diff --git a/src/config.c b/src/config.c
+index 691b8a045..b134b5543 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -2426,6 +2426,8 @@ standardConfig configs[] = {
+     createBoolConfig("cluster-replica-no-failover", "cluster-slave-no-failover", MODIFIABLE_CONFIG, server.cluster_slave_no_failover, 0, NULL, NULL), /* Failover by default. */
+     createBoolConfig("replica-lazy-flush", "slave-lazy-flush", MODIFIABLE_CONFIG, server.repl_slave_lazy_flush, 0, NULL, NULL),
+     createBoolConfig("replica-serve-stale-data", "slave-serve-stale-data", MODIFIABLE_CONFIG, server.repl_serve_stale_data, 1, NULL, NULL),
++    createBoolConfig("command-latency-tracking", NULL, MODIFIABLE_CONFIG, server.command_latency_tracking_enabled, 0, NULL, applyCommandLatencyTrackingConfig),
++    createBoolConfig("command-latency-tracking", NULL, MODIFIABLE_CONFIG, server.command_latency_tracking_enabled, 0, NULL, applyCommandLatencyTrackingConfig),
+     createBoolConfig("replica-read-only", "slave-read-only", MODIFIABLE_CONFIG, server.repl_slave_ro, 1, NULL, NULL),
+     createBoolConfig("replica-ignore-maxmemory", "slave-ignore-maxmemory", MODIFIABLE_CONFIG, server.repl_slave_ignore_maxmemory, 1, NULL, NULL),
+     createBoolConfig("jemalloc-bg-thread", NULL, MODIFIABLE_CONFIG, server.jemalloc_bg_thread, 1, NULL, updateJemallocBgThread),
+@@ -2604,6 +2606,10 @@ NULL
+         resetServerStats();
+         resetCommandTableStats();
+         resetErrorTableStats();
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_all);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_read);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_write);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_other);
+         addReply(c,shared.ok);
+     } else if (!strcasecmp(c->argv[1]->ptr,"rewrite") && c->argc == 2) {
+         if (server.configfile == NULL) {
+diff --git a/src/module.c b/src/module.c
+index 0ce9b369a..95d9c9269 100644
+--- a/src/module.c
++++ b/src/module.c
+@@ -916,6 +916,8 @@ int RM_CreateCommand(RedisModuleCtx *ctx, const char *name, RedisModuleCmdFunc c
+     cp->rediscmd->microseconds = 0;
+     cp->rediscmd->calls = 0;
+     cp->rediscmd->rejected_calls = 0;
++    initCommandExtendedTracking(cp->rediscmd);
++    initCommandExtendedTracking(cp->rediscmd);
+     cp->rediscmd->failed_calls = 0;
+     dictAdd(server.commands,sdsdup(cmdname),cp->rediscmd);
+     dictAdd(server.orig_commands,sdsdup(cmdname),cp->rediscmd);
+diff --git a/src/server.c b/src/server.c
+index 55562732b..6f22a1623 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -2756,9 +2756,15 @@ void initServerConfig(void) {
+     /* Command table -- we initialize it here as it is part of the
+      * initial configuration, since command names may be changed via
+      * redis.conf using the rename-command directive. */
++    memset(&server.cmd_latency_aggr_all, 0, sizeof(server.cmd_latency_aggr_all));
++    memset(&server.cmd_latency_aggr_read, 0, sizeof(server.cmd_latency_aggr_read));
++    memset(&server.cmd_latency_aggr_write, 0, sizeof(server.cmd_latency_aggr_write));
++    memset(&server.cmd_latency_aggr_other, 0, sizeof(server.cmd_latency_aggr_other));
++    server.command_latency_tracking_prev_enabled = -1;
+     server.commands = dictCreate(&commandTableDictType,NULL);
+     server.orig_commands = dictCreate(&commandTableDictType,NULL);
+     populateCommandTable();
++    initCommandLatencyTracking();
+     server.delCommand = lookupCommandByCString("del");
+     server.multiCommand = lookupCommandByCString("multi");
+     server.lpushCommand = lookupCommandByCString("lpush");
+@@ -3497,6 +3503,7 @@ void resetCommandTableStats(void) {
+         c->calls = 0;
+         c->rejected_calls = 0;
+         c->failed_calls = 0;
++        resetCommandExtendedTracking(c);
+     }
+     dictReleaseIterator(di);
+ 
+@@ -3768,6 +3775,7 @@ void call(client *c, int flags) {
+      * the same error twice. */
+     if ((server.stat_total_error_replies - prev_err_count) > 0) {
+         real_cmd->failed_calls++;
++        CMD_LATENCY_ERROR_UPDATE(real_cmd, 0);
+     }
+ 
+     /* After executing command, we will close the client after writing entire
+@@ -3827,6 +3835,7 @@ void call(client *c, int flags) {
+     if (flags & CMD_CALL_STATS) {
+         real_cmd->microseconds += duration;
+         real_cmd->calls++;
++        CMD_LATENCY_STATS_UPDATE(real_cmd, duration);
+     }
+ 
+     /* Propagate the command into the AOF and replication link */
+@@ -3949,6 +3958,7 @@ void call(client *c, int flags) {
+ void rejectCommand(client *c, robj *reply) {
+     flagTransaction(c);
+     if (c->cmd) c->cmd->rejected_calls++;
++    if (c->cmd) CMD_LATENCY_ERROR_UPDATE(c->cmd, 1);
+     if (c->cmd && c->cmd->proc == execCommand) {
+         execCommandAbort(c, reply->ptr);
+     } else {
+@@ -3959,6 +3969,7 @@ void rejectCommand(client *c, robj *reply) {
+ 
+ void rejectCommandFormat(client *c, const char *fmt, ...) {
+     if (c->cmd) c->cmd->rejected_calls++;
++    if (c->cmd) CMD_LATENCY_ERROR_UPDATE(c->cmd, 1);
+     flagTransaction(c);
+     va_list ap;
+     va_start(ap,fmt);
+@@ -5335,13 +5346,28 @@ sds genRedisInfoString(const char *section) {
+                 continue;
+             info = sdscatprintf(info,
+                 "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
+-                ",rejected_calls=%lld,failed_calls=%lld\r\n",
++                ",rejected_calls=%lld,failed_calls=%lld",
+                 getSafeInfoString(c->name, strlen(c->name), &tmpsafe), c->calls, c->microseconds,
+                 (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
+                 c->rejected_calls, c->failed_calls);
++            if (commandLatencyTrackingIsEnabled()) {
++                info = formatCommandLatencyExtendedStats(info, c);
++            }
++            info = sdscat(info, "\r\n");
+             if (tmpsafe != NULL) zfree(tmpsafe);
+         }
+         dictReleaseIterator(di);
++        /* Append extended aggregate category lines when tracking is enabled. */
++        if (commandLatencyTrackingIsEnabled()) {
++            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_all))
++                info = formatAggregateLatencyStats(info, "-", &server.cmd_latency_aggr_all);
++            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_read))
++                info = formatAggregateLatencyStats(info, "r", &server.cmd_latency_aggr_read);
++            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_write))
++                info = formatAggregateLatencyStats(info, "w", &server.cmd_latency_aggr_write);
++            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_other))
++                info = formatAggregateLatencyStats(info, "o", &server.cmd_latency_aggr_other);
++        }
+     }
+     /* Error statistics */
+     if (allsections || defsections || !strcasecmp(section,"errorstats")) {
+-- 
+2.43.0
+
