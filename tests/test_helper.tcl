@@ -15,6 +15,9 @@ source tests/support/util.tcl
 
 set ::all_tests {
     unit/printver
+    unit/commandstats
+    unit/commandstats_ext
+    unit/commandstats_verify
     unit/dump
     unit/auth
     unit/protocol
