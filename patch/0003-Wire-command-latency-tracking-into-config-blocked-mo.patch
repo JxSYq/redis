@@ -1,0 +1,80 @@
+From 3964baa5b1673d46721f75e452cc809e01c026db Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Thu, 28 May 2026 09:12:21 +0800
+Subject: [PATCH 3/4] Wire command-latency-tracking into config, blocked,
+ module paths with rejectCommand fix
+
+---
+ src/blocked.c | 5 ++++-
+ src/config.c  | 5 +++++
+ src/module.c  | 7 +++++++
+ 3 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/blocked.c b/src/blocked.c
+index 7b48fcab6..7dd60f21c 100644
+--- a/src/blocked.c
++++ b/src/blocked.c
+@@ -108,8 +108,11 @@ void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int had_err
+     c->lastcmd->microseconds += total_cmd_duration;
+     c->lastcmd->calls++;
+     server.stat_numcommands++;
+-    if (had_errors)
++    if (had_errors) {
+         c->lastcmd->failed_calls++;
++        CMD_LATENCY_ERROR_UPDATE(c->lastcmd, 0);
++    }
++    CMD_LATENCY_STATS_UPDATE(c->lastcmd, total_cmd_duration);
+     if (server.latency_tracking_enabled)
+         updateCommandLatencyHistogram(&(c->lastcmd->latency_histogram), total_cmd_duration*1000);
+     /* Log the command into the Slow log if needed. */
+diff --git a/src/config.c b/src/config.c
+index cde2dd6f8..2e8913047 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -3095,6 +3095,7 @@ standardConfig static_configs[] = {
+     createBoolConfig("cluster-allow-replica-migration", NULL, MODIFIABLE_CONFIG, server.cluster_allow_replica_migration, 1, NULL, NULL),
+     createBoolConfig("replica-announced", NULL, MODIFIABLE_CONFIG, server.replica_announced, 1, NULL, NULL),
+     createBoolConfig("latency-tracking", NULL, MODIFIABLE_CONFIG, server.latency_tracking_enabled, 1, NULL, NULL),
++    createBoolConfig("command-latency-tracking", NULL, MODIFIABLE_CONFIG, server.command_latency_tracking_enabled, 0, NULL, applyCommandLatencyTrackingConfig),
+     createBoolConfig("aof-disable-auto-gc", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.aof_disable_auto_gc, 0, NULL, updateAofAutoGCEnabled),
+     createBoolConfig("replica-ignore-disk-write-errors", NULL, MODIFIABLE_CONFIG, server.repl_ignore_disk_write_error, 0, NULL, NULL),
+     createBoolConfig("lua-enable-deprecated-api", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.lua_enable_deprecated_api, 0, NULL, NULL),
+@@ -3392,6 +3393,10 @@ void configResetStatCommand(client *c) {
+     resetServerStats();
+     resetCommandTableStats(server.commands);
+     resetErrorTableStats();
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_all);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_read);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_write);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_other);
+     addReply(c,shared.ok);
+ }
+ 
+diff --git a/src/module.c b/src/module.c
+index d58918201..2178ced05 100644
+--- a/src/module.c
++++ b/src/module.c
+@@ -1326,6 +1326,10 @@ RedisModuleCommand *moduleCreateCommandProxy(struct RedisModule *module, sds dec
+     cp->rediscmd->calls = 0;
+     cp->rediscmd->rejected_calls = 0;
+     cp->rediscmd->failed_calls = 0;
++    /* Zero-initialize extended command latency tracking fields so
++     * cleanup paths (module unload, CONFIG SET, etc.) never encounter
++     * uninitialized histogram pointers. */
++    initCommandExtendedTracking(cp->rediscmd);
+     return cp;
+ }
+ 
+@@ -12122,6 +12126,9 @@ void moduleUnregisterCommands(struct RedisModule *module) {
+ 
+         serverAssert(dictDelete(server.commands, cmd->fullname) == DICT_OK);
+         serverAssert(dictDelete(server.orig_commands, cmd->fullname) == DICT_OK);
++        /* Release extended tracking histograms (including nested subcommands)
++         * before freeing command-owned fields. */
++        resetCommandExtendedTrackingRecursive(cmd);
+         sdsfree((sds)cmd->declared_name);
+         sdsfree(cmd->fullname);
+         zfree(cmd);
+-- 
+2.43.0
+
