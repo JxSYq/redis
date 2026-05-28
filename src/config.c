@@ -2426,6 +2426,7 @@ standardConfig configs[] = {
     createBoolConfig("cluster-replica-no-failover", "cluster-slave-no-failover", MODIFIABLE_CONFIG, server.cluster_slave_no_failover, 0, NULL, NULL), /* Failover by default. */
     createBoolConfig("replica-lazy-flush", "slave-lazy-flush", MODIFIABLE_CONFIG, server.repl_slave_lazy_flush, 0, NULL, NULL),
     createBoolConfig("replica-serve-stale-data", "slave-serve-stale-data", MODIFIABLE_CONFIG, server.repl_serve_stale_data, 1, NULL, NULL),
+    createBoolConfig("command-latency-tracking", NULL, MODIFIABLE_CONFIG, server.command_latency_tracking_enabled, 0, NULL, applyCommandLatencyTrackingConfig),
     createBoolConfig("replica-read-only", "slave-read-only", MODIFIABLE_CONFIG, server.repl_slave_ro, 1, NULL, NULL),
     createBoolConfig("replica-ignore-maxmemory", "slave-ignore-maxmemory", MODIFIABLE_CONFIG, server.repl_slave_ignore_maxmemory, 1, NULL, NULL),
     createBoolConfig("jemalloc-bg-thread", NULL, MODIFIABLE_CONFIG, server.jemalloc_bg_thread, 1, NULL, updateJemallocBgThread),
@@ -2604,6 +2605,10 @@ NULL
         resetServerStats();
         resetCommandTableStats();
         resetErrorTableStats();
+        resetCommandLatencyAggregate(&server.cmd_latency_aggr_all);
+        resetCommandLatencyAggregate(&server.cmd_latency_aggr_read);
+        resetCommandLatencyAggregate(&server.cmd_latency_aggr_write);
+        resetCommandLatencyAggregate(&server.cmd_latency_aggr_other);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"rewrite") && c->argc == 2) {
         if (server.configfile == NULL) {

@@ -69,6 +69,7 @@ typedef long long ustime_t; /* microsecond time type. */
 #include "version.h" /* Version macro */
 #include "util.h"    /* Misc functions useful in many places */
 #include "latency.h" /* Latency monitor API */
+#include "cmd_latency_ext.h"
 #include "sparkline.h" /* ASCII graphs API */
 #include "quicklist.h"  /* Lists are encoded as linked lists of
                            N-elements flat arrays */
@@ -1606,6 +1607,13 @@ struct redisServer {
     int lazyfree_lazy_user_flush;
     /* Latency monitor */
     long long latency_monitor_threshold;
+    /* Extended command-level latency tracking (command-latency-tracking config). */
+    int command_latency_tracking_enabled;
+    int command_latency_tracking_prev_enabled;
+    commandLatencyAggregate cmd_latency_aggr_all;
+    commandLatencyAggregate cmd_latency_aggr_read;
+    commandLatencyAggregate cmd_latency_aggr_write;
+    commandLatencyAggregate cmd_latency_aggr_other;
     dict *latency_events;
     /* ACLs */
     char *acl_filename;           /* ACL Users file. NULL if not configured. */
@@ -1674,6 +1682,7 @@ struct redisCommand {
                    ACLs. A connection is able to execute a given command if
                    the user associated to the connection has this command
                    bit set in the bitmap of allowed commands. */
+    commandLatencyExtData latency_ext;
 };
 
 struct redisError {
