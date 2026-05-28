@@ -3095,6 +3095,7 @@ standardConfig static_configs[] = {
     createBoolConfig("cluster-allow-replica-migration", NULL, MODIFIABLE_CONFIG, server.cluster_allow_replica_migration, 1, NULL, NULL),
     createBoolConfig("replica-announced", NULL, MODIFIABLE_CONFIG, server.replica_announced, 1, NULL, NULL),
     createBoolConfig("latency-tracking", NULL, MODIFIABLE_CONFIG, server.latency_tracking_enabled, 1, NULL, NULL),
+    createBoolConfig("command-latency-tracking", NULL, MODIFIABLE_CONFIG, server.command_latency_tracking_enabled, 0, NULL, applyCommandLatencyTrackingConfig),
     createBoolConfig("aof-disable-auto-gc", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.aof_disable_auto_gc, 0, NULL, updateAofAutoGCEnabled),
     createBoolConfig("replica-ignore-disk-write-errors", NULL, MODIFIABLE_CONFIG, server.repl_ignore_disk_write_error, 0, NULL, NULL),
     createBoolConfig("lua-enable-deprecated-api", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.lua_enable_deprecated_api, 0, NULL, NULL),
@@ -3392,6 +3393,10 @@ void configResetStatCommand(client *c) {
     resetServerStats();
     resetCommandTableStats(server.commands);
     resetErrorTableStats();
+    resetCommandLatencyAggregate(&server.cmd_latency_aggr_all);
+    resetCommandLatencyAggregate(&server.cmd_latency_aggr_read);
+    resetCommandLatencyAggregate(&server.cmd_latency_aggr_write);
+    resetCommandLatencyAggregate(&server.cmd_latency_aggr_other);
     addReply(c,shared.ok);
 }
 
