@@ -1711,9 +1711,15 @@ void initServerConfig(void) {
     /* Command table -- we initiialize it here as it is part of the
      * initial configuration, since command names may be changed via
      * redis.conf using the rename-command directive. */
-    server.commands = dictCreate(&commandTableDictType,NULL);
+    memset(&server.cmd_latency_aggr_all, 0, sizeof(server.cmd_latency_aggr_all));
+    memset(&server.cmd_latency_aggr_read, 0, sizeof(server.cmd_latency_aggr_read));
+    memset(&server.cmd_latency_aggr_write, 0, sizeof(server.cmd_latency_aggr_write));
+    memset(&server.cmd_latency_aggr_other, 0, sizeof(server.cmd_latency_aggr_other));
+    server.command_latency_tracking_prev_enabled = -1;
+        server.commands = dictCreate(&commandTableDictType,NULL);
     server.orig_commands = dictCreate(&commandTableDictType,NULL);
     populateCommandTable();
+    initCommandLatencyTracking();
     server.delCommand = lookupCommandByCString("del");
     server.multiCommand = lookupCommandByCString("multi");
     server.lpushCommand = lookupCommandByCString("lpush");
@@ -2262,9 +2268,15 @@ void resetCommandTableStats(void) {
         c = (struct redisCommand *) dictGetVal(de);
         c->microseconds = 0;
         c->calls = 0;
+        c->rejected_calls = 0;
+        c->failed_calls = 0;
+        resetCommandExtendedTracking(c);
     }
     dictReleaseIterator(di);
-
+    resetCommandLatencyAggregate(&server.cmd_latency_aggr_all);
+    resetCommandLatencyAggregate(&server.cmd_latency_aggr_read);
+    resetCommandLatencyAggregate(&server.cmd_latency_aggr_write);
+    resetCommandLatencyAggregate(&server.cmd_latency_aggr_other);
 }
 
 /* ========================== Redis OP Array API ============================ */
@@ -2509,6 +2521,7 @@ void call(client *c, int flags) {
          * EXPIRE, GEOADD, etc. */
         real_cmd->microseconds += duration;
         real_cmd->calls++;
+        CMD_LATENCY_STATS_UPDATE(real_cmd, duration);
     }
 
     /* Propagate the command into the AOF and replication link */
@@ -2610,7 +2623,9 @@ int processCommand(client *c) {
         return C_OK;
     } else if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) ||
                (c->argc < -c->cmd->arity)) {
+        c->cmd->rejected_calls++;
         flagTransaction(c);
+        CMD_LATENCY_ERROR_UPDATE(c->cmd, 1);
         addReplyErrorFormat(c,"wrong number of arguments for '%s' command",
             c->cmd->name);
         return C_OK;
@@ -3652,13 +3667,29 @@ sds genRedisInfoString(char *section) {
         dictEntry *de;
         dictIterator *di;
         di = dictGetSafeIterator(server.commands);
+        if (commandLatencyTrackingIsEnabled()) {
+            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_all))
+                info = formatAggregateLatencyStats(info, "-", &server.cmd_latency_aggr_all);
+            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_other))
+                info = formatAggregateLatencyStats(info, "o", &server.cmd_latency_aggr_other);
+            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_read))
+                info = formatAggregateLatencyStats(info, "r", &server.cmd_latency_aggr_read);
+            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_write))
+                info = formatAggregateLatencyStats(info, "w", &server.cmd_latency_aggr_write);
+        }
         while((de = dictNext(di)) != NULL) {
             c = (struct redisCommand *) dictGetVal(de);
-            if (!c->calls) continue;
+            if (!c->calls && !c->failed_calls && !c->rejected_calls) continue;
             info = sdscatprintf(info,
-                "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f\r\n",
+                "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
+                ",rejected_calls=%lld,failed_calls=%lld",
                 c->name, c->calls, c->microseconds,
-                (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
+                (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
+                c->rejected_calls, c->failed_calls);
+            if (commandLatencyTrackingIsEnabled()) {
+                info = formatCommandLatencyExtendedStats(info, c);
+            }
+            info = sdscat(info, "\r\n");
         }
         dictReleaseIterator(di);
     }

@@ -766,6 +766,9 @@ int RM_CreateCommand(RedisModuleCtx *ctx, const char *name, RedisModuleCmdFunc c
     cp->rediscmd->keystep = keystep;
     cp->rediscmd->microseconds = 0;
     cp->rediscmd->calls = 0;
+    cp->rediscmd->rejected_calls = 0;
+    cp->rediscmd->failed_calls = 0;
+    initCommandExtendedTracking(cp->rediscmd);
     dictAdd(server.commands,sdsdup(cmdname),cp->rediscmd);
     dictAdd(server.orig_commands,sdsdup(cmdname),cp->rediscmd);
     return REDISMODULE_OK;
@@ -5305,6 +5308,8 @@ void moduleUnregisterCommands(struct RedisModule *module) {
                 dictDelete(server.commands,cmdname);
                 dictDelete(server.orig_commands,cmdname);
                 sdsfree(cmdname);
+                /* Release extended latency tracking histograms. */
+                resetCommandExtendedTrackingRecursive(cp->rediscmd);
                 zfree(cp->rediscmd);
                 zfree(cp);
             }
