@@ -2072,6 +2072,15 @@ void initServerConfig(void) {
     server.latency_tracking_info_percentiles[1] = 99.0;  /* p99 */
     server.latency_tracking_info_percentiles[2] = 99.9;  /* p999 */
 
+    /* Ensure extended latency tracking aggregates are zero-initialized.
+     * Using memset avoids potential issues with hdr_close(NULL) inside
+     * resetCommandLatencyAggregate at this early init stage. */
+    memset(&server.cmd_latency_aggr_all, 0, sizeof(server.cmd_latency_aggr_all));
+    memset(&server.cmd_latency_aggr_read, 0, sizeof(server.cmd_latency_aggr_read));
+    memset(&server.cmd_latency_aggr_write, 0, sizeof(server.cmd_latency_aggr_write));
+    memset(&server.cmd_latency_aggr_other, 0, sizeof(server.cmd_latency_aggr_other));
+    server.command_latency_tracking_prev_enabled = -1;
+
     server.lruclock = getLRUClock();
     resetServerSaveParams();
 
@@ -2125,6 +2134,7 @@ void initServerConfig(void) {
     server.commands = dictCreate(&commandTableDictType);
     server.orig_commands = dictCreate(&commandTableDictType);
     populateCommandTable();
+    initCommandLatencyTracking();
 
     /* Debugging */
     server.watchdog_period = 0;
@@ -3060,6 +3070,7 @@ void resetCommandTableStats(dict* commands) {
         c->calls = 0;
         c->rejected_calls = 0;
         c->failed_calls = 0;
+        resetCommandExtendedTracking(c);
         if(c->latency_histogram) {
             hdr_close(c->latency_histogram);
             c->latency_histogram = NULL;
@@ -3423,14 +3434,21 @@ int incrCommandStatsOnError(struct redisCommand *cmd, int flags) {
     /* hold the prev error count captured on the last command execution */
     static long long prev_err_count = 0;
     int res = 0;
-    if (cmd) {
-        if ((server.stat_total_error_replies - prev_err_count) > 0) {
+    if ((server.stat_total_error_replies - prev_err_count) > 0) {
+        if (cmd) {
             if (flags & ERROR_COMMAND_REJECTED) {
                 cmd->rejected_calls++;
                 res = 1;
             } else if (flags & ERROR_COMMAND_FAILED) {
                 cmd->failed_calls++;
                 res = 1;
+            }
+            /* Extended aggregate error counters follow Redis native
+             * commandstats: only errors associated with a known command
+             * are counted.  A NULL cmd (used when the error was counted
+             * elsewhere) does NOT update the extended aggregate. */
+            if (res) {
+                CMD_LATENCY_ERROR_UPDATE(cmd, !!(flags & ERROR_COMMAND_REJECTED));
             }
         }
     }
@@ -3555,6 +3573,12 @@ void call(client *c, int flags) {
          * and not reflected to users. however, the commandstats does show these calls
          * (made by RM_Call), so it should log if they failed or succeeded. */
         real_cmd->failed_calls++;
+        /* Extended aggregate error follows this explicit compensation path.
+         * The !incrCommandStatsOnError(...) condition above ensures mutual
+         * exclusion: if incrCommandStatsOnError already updated the aggregate
+         * (returned 1), we do NOT enter this block.  Double counting of
+         * real_cmd->failed_calls itself is pre-existing Redis 7.2 behavior. */
+        CMD_LATENCY_ERROR_UPDATE(real_cmd, 0);
     }
 
     /* After executing command, we will close the client after writing entire
@@ -3605,7 +3629,8 @@ void call(client *c, int flags) {
     if (update_command_stats && !(c->flags & CLIENT_BLOCKED)) {
         real_cmd->calls++;
         real_cmd->microseconds += c->duration;
-        if (server.latency_tracking_enabled && !(c->flags & CLIENT_BLOCKED))
+        CMD_LATENCY_STATS_UPDATE(real_cmd, c->duration);
+        if (server.latency_tracking_enabled)
             updateCommandLatencyHistogram(&(real_cmd->latency_histogram), c->duration*1000);
     }
 
@@ -3712,6 +3737,7 @@ void rejectCommand(client *c, robj *reply) {
     flagTransaction(c);
     c->duration = 0;
     if (c->cmd) c->cmd->rejected_calls++;
+    if (c->cmd) CMD_LATENCY_ERROR_UPDATE(c->cmd, 1);
     if (c->cmd && c->cmd->proc == execCommand) {
         execCommandAbort(c, reply->ptr);
     } else {
@@ -3724,6 +3750,7 @@ void rejectCommandSds(client *c, sds s) {
     flagTransaction(c);
     c->duration = 0;
     if (c->cmd) c->cmd->rejected_calls++;
+    if (c->cmd) CMD_LATENCY_ERROR_UPDATE(c->cmd, 1);
     if (c->cmd && c->cmd->proc == execCommand) {
         execCommandAbort(c, s);
         sdsfree(s);
@@ -5338,25 +5365,75 @@ const char *getSafeInfoString(const char *s, size_t len, char **tmp) {
                        sizeof(unsafe_info_chars)-1);
 }
 
+/* Aggregate lines (cmdstat_-, cmdstat_r, cmdstat_w, cmdstat_o) are appended
+ * only when processing the outermost dict (server.commands).  Recursive
+ * subcommand walks do not duplicate aggregate output. */
 sds genRedisInfoStringCommandStats(sds info, dict *commands) {
     struct redisCommand *c;
     dictEntry *de;
     dictIterator *di;
     di = dictGetSafeIterator(commands);
+
+    /* Output aggregate category lines first: -, o, r, w (outermost call only). */
+    if (commands == server.commands && commandLatencyTrackingIsEnabled()) {
+        info = formatAggregateLatencyStats(info, "-", &server.cmd_latency_aggr_all);
+        info = formatAggregateLatencyStats(info, "o", &server.cmd_latency_aggr_other);
+        info = formatAggregateLatencyStats(info, "r", &server.cmd_latency_aggr_read);
+        info = formatAggregateLatencyStats(info, "w", &server.cmd_latency_aggr_write);
+    }
+
     while((de = dictNext(di)) != NULL) {
-        char *tmpsafe;
+        char *tmpsafe = NULL;
         c = (struct redisCommand *) dictGetVal(de);
-        if (c->calls || c->failed_calls || c->rejected_calls) {
-            info = sdscatprintf(info,
-                "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
-                ",rejected_calls=%lld,failed_calls=%lld\r\n",
-                getSafeInfoString(c->fullname, sdslen(c->fullname), &tmpsafe), c->calls, c->microseconds,
-                (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
-                c->rejected_calls, c->failed_calls);
-            if (tmpsafe != NULL) zfree(tmpsafe);
-        }
-        if (c->subcommands_dict) {
-            info = genRedisInfoStringCommandStats(info, c->subcommands_dict);
+        if (c->subcommands_dict && commandLatencyTrackingIsEnabled()) {
+            /* Tracking ON: merge subcommand native stats for display.
+             * Extended stats come from the parent command (may be 0 for
+             * container commands).  Aggregate rows provide authoritative
+             * per-category extended stats. */
+            long long merged_calls = c->calls;
+            long long merged_usec = c->microseconds;
+            long long merged_rejected = c->rejected_calls;
+            long long merged_failed = c->failed_calls;
+            struct redisCommand *sc; dictEntry *sde;
+            dictIterator *sdi = dictGetSafeIterator(c->subcommands_dict);
+            while ((sde = dictNext(sdi)) != NULL) {
+                sc = (struct redisCommand *) dictGetVal(sde);
+                merged_calls += sc->calls;
+                merged_usec += sc->microseconds;
+                merged_rejected += sc->rejected_calls;
+                merged_failed += sc->failed_calls;
+            }
+            dictReleaseIterator(sdi);
+            if (merged_calls || merged_failed || merged_rejected) {
+                info = sdscatprintf(info,
+                    "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
+                    ",rejected_calls=%lld,failed_calls=%lld",
+                    getSafeInfoString(c->fullname, sdslen(c->fullname), &tmpsafe),
+                    merged_calls, merged_usec,
+                    (merged_calls == 0) ? 0 : ((double)merged_usec / merged_calls),
+                    merged_rejected, merged_failed);
+                info = formatCommandLatencyExtendedStats(info, c);
+                info = sdscat(info, "\r\n");
+                if (tmpsafe != NULL) zfree(tmpsafe);
+            }
+        } else {
+            /* Tracking OFF or no subcommands: original behavior. */
+            if (c->calls || c->failed_calls || c->rejected_calls) {
+                info = sdscatprintf(info,
+                    "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
+                    ",rejected_calls=%lld,failed_calls=%lld",
+                    getSafeInfoString(c->fullname, sdslen(c->fullname), &tmpsafe), c->calls, c->microseconds,
+                    (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
+                    c->rejected_calls, c->failed_calls);
+                if (commandLatencyTrackingIsEnabled()) {
+                    info = formatCommandLatencyExtendedStats(info, c);
+                }
+                info = sdscat(info, "\r\n");
+                if (tmpsafe != NULL) zfree(tmpsafe);
+            }
+            if (c->subcommands_dict) {
+                info = genRedisInfoStringCommandStats(info, c->subcommands_dict);
+            }
         }
     }
     dictReleaseIterator(di);
@@ -5384,7 +5461,7 @@ sds genRedisInfoStringLatencyStats(sds info, dict *commands) {
     dictIterator *di;
     di = dictGetSafeIterator(commands);
     while((de = dictNext(di)) != NULL) {
-        char *tmpsafe;
+        char *tmpsafe = NULL;
         c = (struct redisCommand *) dictGetVal(de);
         if (c->latency_histogram) {
             info = fillPercentileDistributionLatencies(info,
@@ -6193,7 +6270,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         raxSeek(&ri,"^",NULL,0);
         struct redisError *e;
         while(raxNext(&ri)) {
-            char *tmpsafe;
+            char *tmpsafe = NULL;
             e = (struct redisError *) ri.data;
             info = sdscatprintf(info,
                 "errorstat_%.*s:count=%lld\r\n",
