@@ -12124,11 +12124,12 @@ void moduleUnregisterCommands(struct RedisModule *module) {
         struct redisCommand *cmd = dictGetVal(de);
         if (moduleFreeCommand(module, cmd) != C_OK) continue;
 
+        /* Release extended tracking histograms while subcommands_dict
+         * is still valid (moduleFreeCommand releases it without NULLing). */
+        resetCommandExtendedTrackingRecursive(cmd);
+
         serverAssert(dictDelete(server.commands, cmd->fullname) == DICT_OK);
         serverAssert(dictDelete(server.orig_commands, cmd->fullname) == DICT_OK);
-        /* Release extended tracking histograms (including nested subcommands)
-         * before freeing command-owned fields. */
-        resetCommandExtendedTrackingRecursive(cmd);
         sdsfree((sds)cmd->declared_name);
         sdsfree(cmd->fullname);
         zfree(cmd);

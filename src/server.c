@@ -5376,14 +5376,10 @@ sds genRedisInfoStringCommandStats(sds info, dict *commands) {
 
     /* Output aggregate category lines first: -, o, r, w (outermost call only). */
     if (commands == server.commands && commandLatencyTrackingIsEnabled()) {
-        if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_all))
-            info = formatAggregateLatencyStats(info, "-", &server.cmd_latency_aggr_all);
-        if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_other))
-            info = formatAggregateLatencyStats(info, "o", &server.cmd_latency_aggr_other);
-        if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_read))
-            info = formatAggregateLatencyStats(info, "r", &server.cmd_latency_aggr_read);
-        if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_write))
-            info = formatAggregateLatencyStats(info, "w", &server.cmd_latency_aggr_write);
+        info = formatAggregateLatencyStats(info, "-", &server.cmd_latency_aggr_all);
+        info = formatAggregateLatencyStats(info, "o", &server.cmd_latency_aggr_other);
+        info = formatAggregateLatencyStats(info, "r", &server.cmd_latency_aggr_read);
+        info = formatAggregateLatencyStats(info, "w", &server.cmd_latency_aggr_write);
     }
 
     while((de = dictNext(di)) != NULL) {
