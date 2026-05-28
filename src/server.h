@@ -62,6 +62,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #include "version.h" /* Version macro */
 #include "util.h"    /* Misc functions useful in many places */
 #include "latency.h" /* Latency monitor API */
+#include "cmd_latency_ext.h"
 #include "sparkline.h" /* ASCII graphs API */
 #include "quicklist.h"  /* Lists are encoded as linked lists of
                            N-elements flat arrays */
@@ -937,6 +938,12 @@ struct redisServer {
     /* Fields used only for stats */
     time_t stat_starttime;          /* Server start time */
     long long stat_numcommands;     /* Number of processed commands */
+    int command_latency_tracking_enabled;
+    int command_latency_tracking_prev_enabled;
+    commandLatencyAggregate cmd_latency_aggr_all;
+    commandLatencyAggregate cmd_latency_aggr_read;
+    commandLatencyAggregate cmd_latency_aggr_write;
+    commandLatencyAggregate cmd_latency_aggr_other;
     long long stat_numconnections;  /* Number of connections received */
     long long stat_expiredkeys;     /* Number of expired keys */
     double stat_expired_stale_perc; /* Percentage of keys probably expired */
@@ -1229,6 +1236,8 @@ struct redisCommand {
     int lastkey;  /* The last argument that's a key */
     int keystep;  /* The step between first and last key */
     long long microseconds, calls;
+    long long rejected_calls, failed_calls;
+    commandLatencyExtData latency_ext;
 };
 
 struct redisFunctionSym {
