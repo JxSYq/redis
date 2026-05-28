@@ -1,0 +1,836 @@
+From 003e16e9645d2b43e7d383b1064fbb40a3c409a3 Mon Sep 17 00:00:00 2001
+From: song <songyiqiang1994@163.com>
+Date: Thu, 28 May 2026 09:13:31 +0800
+Subject: [PATCH 2/3] Add command-latency-tracking module for Redis 5
+
+---
+ src/Makefile          |   2 +-
+ src/cmd_latency_ext.c | 384 ++++++++++++++++++++++++++++++++++++++++++
+ src/cmd_latency_ext.h | 224 ++++++++++++++++++++++++
+ src/config.c          |  21 +++
+ src/module.c          |   3 +
+ src/server.c          |  36 +++-
+ src/server.h          |   9 +
+ 7 files changed, 674 insertions(+), 5 deletions(-)
+ create mode 100644 src/cmd_latency_ext.c
+ create mode 100644 src/cmd_latency_ext.h
+
+diff --git a/src/Makefile b/src/Makefile
+index 0ddd9558d..a650cd4a8 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -173,7 +173,7 @@ endif
+ 
+ REDIS_SERVER_NAME=redis-server
+ REDIS_SENTINEL_NAME=redis-sentinel
+-REDIS_SERVER_OBJ=adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o scripting.o bio.o rio.o rand.o memtest.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o
++REDIS_SERVER_OBJ=adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o scripting.o bio.o rio.o rand.o memtest.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o cmd_latency_ext.o
+ REDIS_CLI_NAME=redis-cli
+ REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o anet.o ae.o crc64.o siphash.o crc16.o
+ REDIS_BENCHMARK_NAME=redis-benchmark
+diff --git a/src/cmd_latency_ext.c b/src/cmd_latency_ext.c
+new file mode 100644
+index 000000000..887a094fd
+--- /dev/null
++++ b/src/cmd_latency_ext.c
+@@ -0,0 +1,384 @@
++/*
++ * Copyright (c) 2024, Redis Ltd.
++ * All rights reserved.
++ *
++ * Extended command-level latency tracking for INFO commandstats.
++ */
++
++#include "server.h"
++#include "hdr_histogram.h"
++#include "cmd_latency_ext.h"
++
++/* Redis 4/5: provide our own updateCommandLatencyHistogram (not available). */
++static void updateCommandLatencyHistogram(struct hdr_histogram **h, int64_t duration) {
++    if (duration < LATENCY_HISTOGRAM_MIN_VALUE) duration = LATENCY_HISTOGRAM_MIN_VALUE;
++    if (duration > LATENCY_HISTOGRAM_MAX_VALUE) duration = LATENCY_HISTOGRAM_MAX_VALUE;
++    if (*h == NULL) {
++        if (hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE,
++                      LATENCY_HISTOGRAM_PRECISION, h) != 0)
++            return;
++    }
++    hdr_record_value(*h, duration);
++}
++
++
++
++/* =========================================================================
++ * Recording functions
++ * ========================================================================= */
++
++/* Record a latency sample into the 1-minute approximate histogram.
++ * Uses a 120-second tumbling window: the histogram is reset every
++ * 120 seconds, providing an approximation of "recent 1-2 minutes"
++ * rather than a precise 60-second sliding window.  Ring-buffer
++ * stats (calls_minute, usec_minute, etc.) are exact sliding windows. */
++static void recordCommandLatencyHistogram1m(struct hdr_histogram **histogram,
++                                      long long *reset_time, long long duration_ns) {
++    long long now = server.unixtime;
++
++    /* Tumbling window: discard histogram every 120 seconds. */
++    if (*histogram != NULL && now - *reset_time >= 120) {
++        hdr_close(*histogram);
++        *histogram = NULL;
++    }
++
++    if (*histogram == NULL) {
++        /* Cooldown check: if a previous allocation failed, don't retry
++         * for 120 seconds to avoid OOM-thrashing and log storms.
++         * *reset_time == 0 means the histogram was never allocated
++         * (startup / resetstate), so we always allow the first attempt. */
++        if (*reset_time != 0 && now - *reset_time < 120)
++            return;
++
++        if (hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE,
++                      LATENCY_HISTOGRAM_PRECISION, histogram) != 0 ||
++            *histogram == NULL) {
++            *reset_time = now;  /* start cooldown: retry in 120s */
++            serverLog(LL_WARNING, "Failed to allocate 1-minute latency histogram, will retry in 120s");
++            return;
++        }
++        *reset_time = now;
++    }
++
++    if (duration_ns < LATENCY_HISTOGRAM_MIN_VALUE)
++        duration_ns = LATENCY_HISTOGRAM_MIN_VALUE;
++    if (duration_ns > LATENCY_HISTOGRAM_MAX_VALUE)
++        duration_ns = LATENCY_HISTOGRAM_MAX_VALUE;
++    hdr_record_value(*histogram, duration_ns);
++}
++
++static void updateCommandLatencyWindow(commandLatencyWindow *window, long long duration_us) {
++    long long now = server.unixtime;
++    int idx = now % CMD_LATENCY_WINDOW_1M_SLOTS;
++    commandLatencySlot *slot = &window->slots[idx];
++
++    if (slot->slot_time != now) {
++        memset(slot, 0, sizeof(*slot));
++        slot->slot_time = now;
++        slot->min_usec = duration_us;
++        slot->max_usec = duration_us;
++    } else {
++        if (duration_us < slot->min_usec)
++            slot->min_usec = duration_us;
++        if (duration_us > slot->max_usec)
++            slot->max_usec = duration_us;
++    }
++    slot->calls++;
++    slot->sum_usec += duration_us;
++}
++
++/* Return the appropriate aggregate category for a command.
++ * Priority: ADMIN -> other; (!READ && !WRITE) -> other; READ -> read; else -> write. */
++static commandLatencyAggregate *getCategoryAggregate(struct redisCommand *cmd) {
++    int is_admin = (cmd->flags & CMD_ADMIN) != 0;
++    int is_read  = (cmd->flags & CMD_READONLY) != 0;
++    int is_write = (cmd->flags & CMD_WRITE) != 0;
++    if (is_admin || (!is_read && !is_write))
++        return &server.cmd_latency_aggr_other;
++    if (is_read)
++        return &server.cmd_latency_aggr_read;
++    return &server.cmd_latency_aggr_write;
++}
++
++/* Update a single aggregate (all / read / write / other) with one latency sample. */
++static void updateLatencyAggregate(commandLatencyAggregate *aggr, long long duration_us) {
++    if (aggr->calls == 0 || duration_us < aggr->usec_min)
++        aggr->usec_min = duration_us;
++    if (duration_us > aggr->usec_max)
++        aggr->usec_max = duration_us;
++    aggr->calls++;
++    aggr->microseconds += duration_us;
++    updateCommandLatencyHistogram(&aggr->latency_histogram, duration_us * 1000);
++    updateCommandLatencyWindow(&aggr->latency_window, duration_us);
++    recordCommandLatencyHistogram1m(&aggr->latency_histogram_1m,
++                                     &aggr->latency_histogram_1m_reset_time,
++                                     duration_us * 1000);
++}
++
++void updateCommandExtendedLatencyStats(struct redisCommand *cmd, long long duration_us) {
++    if (!server.command_latency_tracking_enabled || !cmd) return;
++    if (cmd->latency_ext.latency_samples == 0 || duration_us < cmd->latency_ext.usec_min)
++        cmd->latency_ext.usec_min = duration_us;
++    if (duration_us > cmd->latency_ext.usec_max)
++        cmd->latency_ext.usec_max = duration_us;
++    cmd->latency_ext.latency_samples++;
++
++    /* Uses Redis native updateCommandLatencyHistogram() for all-time
++     * histogram allocation; OOM behavior intentionally follows native
++     * latency-tracking -- the 1-minute histogram has its own cooldown
++     * (see recordCommandLatencyHistogram1m). */
++
++    updateCommandLatencyHistogram(&cmd->latency_ext.latency_histogram_all, duration_us * 1000);
++
++    recordCommandLatencyHistogram1m(&cmd->latency_ext.latency_histogram_1m,
++                                     &cmd->latency_ext.latency_histogram_1m_reset_time,
++                                     duration_us * 1000);
++
++    updateCommandLatencyWindow(&cmd->latency_ext.latency_window, duration_us);
++
++    updateLatencyAggregate(&server.cmd_latency_aggr_all, duration_us);
++    updateLatencyAggregate(getCategoryAggregate(cmd), duration_us);
++}
++
++void updateCommandAggregateError(struct redisCommand *cmd, int is_rejected) {
++    if (!server.command_latency_tracking_enabled) return;
++
++    server.cmd_latency_aggr_all.rejected_calls += (is_rejected ? 1 : 0);
++    server.cmd_latency_aggr_all.failed_calls += (is_rejected ? 0 : 1);
++
++    /* If a caller explicitly passes cmd == NULL (defensive / future use),
++     * fall back to "other" category.  Normal commandstats error accounting
++     * passes a known command. */
++    commandLatencyAggregate *aggr;
++    if (cmd)
++        aggr = getCategoryAggregate(cmd);
++    else
++        aggr = &server.cmd_latency_aggr_other;
++
++    aggr->rejected_calls += (is_rejected ? 1 : 0);
++    aggr->failed_calls += (is_rejected ? 0 : 1);
++}
++
++/* =========================================================================
++ * Reset / initialization
++ * ========================================================================= */
++
++void resetCommandLatencyWindow(commandLatencyWindow *window) {
++    memset(window, 0, sizeof(*window));
++}
++
++void resetCommandLatencyAggregate(commandLatencyAggregate *aggr) {
++    if (!aggr) return;
++    /* Fast path: skip heavy reset when tracking data was never recorded. */
++    if (aggr->calls == 0 &&
++        aggr->rejected_calls == 0 &&
++        aggr->failed_calls == 0 &&
++        aggr->latency_histogram == NULL &&
++        aggr->latency_histogram_1m == NULL)
++        return;
++    aggr->microseconds = 0;
++    aggr->calls = 0;
++    aggr->rejected_calls = 0;
++    aggr->failed_calls = 0;
++    aggr->usec_min = 0;
++    aggr->usec_max = 0;
++    resetCommandLatencyWindow(&aggr->latency_window);
++    if (aggr->latency_histogram) {
++        hdr_close(aggr->latency_histogram);
++        aggr->latency_histogram = NULL;
++    }
++    if (aggr->latency_histogram_1m) {
++        hdr_close(aggr->latency_histogram_1m);
++        aggr->latency_histogram_1m = NULL;
++    }
++    aggr->latency_histogram_1m_reset_time = 0;
++}
++
++void resetCommandExtendedTracking(struct redisCommand *c) {
++    if (!c) return;
++    /* Fast path: skip reset when tracking was never used for this command.
++     * Avoids ~2400-byte memset per command (~480KB for 200 commands)
++     * which causes cache pollution on systems under load. */
++    if (c->latency_ext.latency_samples == 0 &&
++        c->latency_ext.latency_histogram_all == NULL &&
++        c->latency_ext.latency_histogram_1m == NULL)
++        return;
++    c->latency_ext.usec_min = 0;
++    c->latency_ext.usec_max = 0;
++    c->latency_ext.latency_samples = 0;
++    resetCommandLatencyWindow(&c->latency_ext.latency_window);
++    if (c->latency_ext.latency_histogram_all) {
++        hdr_close(c->latency_ext.latency_histogram_all);
++        c->latency_ext.latency_histogram_all = NULL;
++    }
++    if (c->latency_ext.latency_histogram_1m) {
++        hdr_close(c->latency_ext.latency_histogram_1m);
++        c->latency_ext.latency_histogram_1m = NULL;
++    }
++    c->latency_ext.latency_histogram_1m_reset_time = 0;
++}
++
++/*
++ * Zero-initialize extended tracking fields for a single command.
++ * Must only be called on freshly-created commands before any latency
++ * histogram can be allocated -- calling on an already-live command
++ * will leak existing histograms.  Use resetCommandExtendedTracking()
++ * for already-live commands.
++ */
++void initCommandExtendedTracking(struct redisCommand *c) {
++    if (!c) return;
++    memset(&c->latency_ext, 0, sizeof(c->latency_ext));
++}
++
++/*
++ * Recursive variant: resets this command and all nested subcommands.
++ * Use when the caller does NOT iterate subcommands on its own
++ * (e.g., applyCommandLatencyTrackingConfig, module command cleanup).
++ * In contexts where the caller already recurses into subcommands
++ * (e.g., resetCommandTableStats), use the non-recursive version above.
++ */
++void resetCommandExtendedTrackingRecursive(struct redisCommand *c) {
++    if (!c) return;
++    resetCommandExtendedTracking(c);
++    /* Redis 4/5: no subcommands_dict; recursion not needed. */
++}
++
++int applyCommandLatencyTrackingConfig(const char **err) {
++    UNUSED(err);
++    int enabled = server.command_latency_tracking_enabled;
++    if (server.command_latency_tracking_prev_enabled == enabled &&
++        server.command_latency_tracking_prev_enabled != -1)
++        return 1;
++    server.command_latency_tracking_prev_enabled = enabled;
++
++    dictIterator *di = dictGetSafeIterator(server.commands);
++    dictEntry *de;
++    while ((de = dictNext(di)) != NULL)
++        resetCommandExtendedTrackingRecursive(dictGetVal(de));
++    dictReleaseIterator(di);
++
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_all);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_read);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_write);
++    resetCommandLatencyAggregate(&server.cmd_latency_aggr_other);
++    return 1;
++}
++
++/* Zero-initialize extended tracking fields for all commands (called once at
++ * startup to ensure static command-table fields are clean). */
++static void initCommandTrackingFields(dict *commands) {
++    dictIterator *di = dictGetSafeIterator(commands);
++    dictEntry *de;
++    while ((de = dictNext(di)) != NULL) {
++        struct redisCommand *c = dictGetVal(de);
++        initCommandExtendedTracking(c);
++        /* Redis 4/5: no subcommands_dict; recursion not needed. */
++    }
++    dictReleaseIterator(di);
++
++}
++void initCommandLatencyTracking(void) {
++    initCommandTrackingFields(server.commands);
++    server.command_latency_tracking_prev_enabled = server.command_latency_tracking_enabled;
++}
++
++int commandLatencyTrackingIsEnabled(void) {
++    return server.command_latency_tracking_enabled;
++}
++
++int commandLatencyAggregateHasData(commandLatencyAggregate *aggr) {
++    return aggr && (aggr->calls > 0 || aggr->rejected_calls > 0 || aggr->failed_calls > 0);
++}
++
++/* =========================================================================
++ * INFO output helpers
++ * ========================================================================= */
++
++void computeCommandLatencyWindowStats(commandLatencyWindow *window, int window_slots,
++                                       long long *calls, long long *sum_usec,
++                                       long long *min_usec, long long *max_usec) {
++    serverAssert(window_slots <= CMD_LATENCY_WINDOW_1M_SLOTS);
++    long long now = server.unixtime;
++    long long c = 0, s = 0, mn = LLONG_MAX, mx = 0;
++
++    for (int i = 0; i < window_slots; i++) {
++        long long ts = now - i;
++        int idx = ts % CMD_LATENCY_WINDOW_1M_SLOTS;
++        if (idx < 0) idx += CMD_LATENCY_WINDOW_1M_SLOTS;
++        commandLatencySlot *slot = &window->slots[idx];
++        if (slot->slot_time != ts) continue;
++        c += slot->calls;
++        s += slot->sum_usec;
++        if (slot->min_usec < mn) mn = slot->min_usec;
++        if (slot->max_usec > mx) mx = slot->max_usec;
++    }
++
++    *calls = c;
++    *sum_usec = s;
++    *min_usec = (c > 0) ? mn : 0;
++    *max_usec = mx;
++}
++
++/* Append 5-second and 1-minute window statistics to the info string. */
++static sds appendWindowStats(sds info, commandLatencyWindow *window,
++                              struct hdr_histogram *hist_1m) {
++    long long c5, s5, mn5, mx5;
++    computeCommandLatencyWindowStats(window, CMD_LATENCY_WINDOW_5S_SLOTS,
++                                      &c5, &s5, &mn5, &mx5);
++    long long avg5 = (c5 > 0) ? (s5 / c5) : 0;
++    info = sdscatprintf(info, ",calls_5s=%lld,usec_5s=%lld,usec_min_5s=%lld,usec_avg_5s=%lld,usec_max_5s=%lld",
++                        c5, s5, mn5, avg5, mx5);
++
++    long long c60, s60, mn60, mx60;
++    computeCommandLatencyWindowStats(window, CMD_LATENCY_WINDOW_1M_SLOTS,
++                                      &c60, &s60, &mn60, &mx60);
++    long long avg60 = (c60 > 0) ? (s60 / c60) : 0;
++    long long p95_1m = 0, p99_1m = 0;
++    if (c60 > 0 && hist_1m && hist_1m->total_count > 0) {
++        p95_1m = hdr_value_at_percentile(hist_1m, 95.0) / 1000;
++        p99_1m = hdr_value_at_percentile(hist_1m, 99.0) / 1000;
++    }
++    info = sdscatprintf(info, ",calls_minute=%lld,usec_minute=%lld,usec_min_minute=%lld,usec_avg_minute=%lld,usec_max_minute=%lld,usec_p95_minute=%lld,usec_p99_minute=%lld",
++                        c60, s60, mn60, avg60, mx60, p95_1m, p99_1m);
++    return info;
++}
++
++sds formatCommandLatencyExtendedStats(sds info, struct redisCommand *cmd) {
++    long long p95 = 0, p99 = 0;
++    if (cmd->latency_ext.latency_histogram_all && cmd->latency_ext.latency_histogram_all->total_count > 0) {
++        p95 = hdr_value_at_percentile(cmd->latency_ext.latency_histogram_all, 95.0) / 1000;
++        p99 = hdr_value_at_percentile(cmd->latency_ext.latency_histogram_all, 99.0) / 1000;
++    }
++
++    info = sdscatprintf(info, ",usec_min=%lld,usec_max=%lld,usec_p95=%lld,usec_p99=%lld",
++                        cmd->latency_ext.usec_min, cmd->latency_ext.usec_max, p95, p99);
++
++    info = appendWindowStats(info, &cmd->latency_ext.latency_window,
++                              cmd->latency_ext.latency_histogram_1m);
++    return info;
++}
++
++sds formatAggregateLatencyStats(sds info, const char *name,
++                                 commandLatencyAggregate *aggr) {
++    if (!aggr) return info;
++    long long p95 = 0, p99 = 0;
++    if (aggr->latency_histogram && aggr->latency_histogram->total_count > 0) {
++        p95 = (long long)(hdr_value_at_percentile(aggr->latency_histogram, 95.0) / 1000);
++        p99 = (long long)(hdr_value_at_percentile(aggr->latency_histogram, 99.0) / 1000);
++    }
++
++    info = sdscatprintf(info,
++        "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
++        ",rejected_calls=%lld,failed_calls=%lld"
++        ",usec_min=%lld,usec_max=%lld,usec_p95=%lld,usec_p99=%lld",
++        name, aggr->calls, aggr->microseconds,
++        (aggr->calls == 0) ? 0.0 : ((double)aggr->microseconds / aggr->calls),
++        aggr->rejected_calls, aggr->failed_calls,
++        aggr->usec_min, aggr->usec_max, p95, p99);
++
++    info = appendWindowStats(info, &aggr->latency_window,
++                              aggr->latency_histogram_1m);
++
++    info = sdscat(info, "\r\n");
++    return info;
++}
+diff --git a/src/cmd_latency_ext.h b/src/cmd_latency_ext.h
+new file mode 100644
+index 000000000..e2ebeb880
+--- /dev/null
++++ b/src/cmd_latency_ext.h
+@@ -0,0 +1,224 @@
++#ifndef unlikely
++#define unlikely(x) __builtin_expect(!!(x), 0)
++#endif
++/*
++ * Copyright (c) 2024, Redis Ltd.
++ * All rights reserved.
++ *
++ * Extended command-level latency tracking for INFO commandstats.
++ *
++ * Controlled by "command-latency-tracking" config (default: no).
++ * All operations run in the main thread -- no locking needed.
++ *
++ * Design decisions (may help reviewers avoid re-raising settled questions):
++ *
++ * 1. latency_histogram_all is separate from the native latency_histogram
++ *    (latency-tracking feature).  Reusing the native histogram would couple
++ *    the two features and cause data leakage when toggling configs.
++ *    The extra ~40 KiB per command is accepted as cost of independence.
++ *
++ * 2. 1-minute P95/P99 is a 120-second tumbling HdrHistogram -- NOT a precise
++ *    60-second sliding window.  calls_minute / usec_minute / usec_min_minute /
++ *    usec_avg_minute / usec_max_minute are exact sliding-window values from
++ *    the ring buffer.  The tumbling histogram avoids O(n*m) histogram
++ *    reconstruction overhead and the per-second-histogram memory explosion
++ *    (2.4 MiB/command for 60 per-second HdrHistograms).
++ *
++ * 3. The commandLatencyWindow (2.4 KiB) is embedded in commandLatencyExtData
++ *    struct rather than heap-allocated.  This avoids a pointer chase and
++ *    allocation overhead on every command call, at the cost of ~1 MiB total
++ *    for ~400 commands even when tracking is disabled.
++ *
++ * 4. Aggregate lines (cmdstat_-, cmdstat_r, cmdstat_w, cmdstat_o) use
++ *    CMD_ADMIN / CMD_READONLY / CMD_WRITE flags for classification.
++ *    Priority: admin > (!read && !write -> other) > read > write.
++ *    This means DEBUG OBJECT (CMD_ADMIN|CMD_READONLY) -> other, not read.
++ *
++ * 5. Toggling config with CONFIG SET resets all command-latency-tracking
++ *    extended statistics. Redis native commandstats (calls/usec/failed/
++ *    rejected) are NOT affected by the toggle.
++ *
++ * 6. usec_per_call uses %.2f, matching Redis 7.2 native format.
++ */
++
++#ifndef __CMD_LATENCY_EXT_H
++#define __CMD_LATENCY_EXT_H
++
++#include "sds.h"
++
++/* Forward declarations -- full definitions are not needed at header level. */
++struct hdr_histogram;
++struct redisCommand;
++struct dict;
++
++/* --------------------------------------------------------------------------
++ * Data structures
++ * -------------------------------------------------------------------------- */
++
++#define CMD_LATENCY_WINDOW_5S_SLOTS  5
++#define CMD_LATENCY_WINDOW_1M_SLOTS 60
++
++/* Redis 6 portability macros */
++#define CMD_LATENCY_CMD_NAME(cmd)       ((cmd)->name)
++#define CMD_LATENCY_HAS_SUBCOMMANDS(cmd) (0)
++#define CMD_LATENCY_CMD_SUBCOMMANDS(cmd) (NULL)
++
++/* Fallback definitions for Redis versions that lack these macros. */
++#ifndef LATENCY_HISTOGRAM_MIN_VALUE
++#define LATENCY_HISTOGRAM_MIN_VALUE 1L
++#endif
++#ifndef LATENCY_HISTOGRAM_MAX_VALUE
++#define LATENCY_HISTOGRAM_MAX_VALUE 1000000000L
++#endif
++#ifndef LATENCY_HISTOGRAM_PRECISION
++#define LATENCY_HISTOGRAM_PRECISION 2
++#endif
++
++typedef struct {
++    long long slot_time;     /* epoch-seconds timestamp of this slot */
++    long long calls;         /* number of calls in this second */
++    long long sum_usec;      /* total microseconds in this second */
++    long long min_usec;      /* min latency (usec) in this second */
++    long long max_usec;      /* max latency (usec) in this second */
++} commandLatencySlot;
++
++typedef struct {
++    commandLatencySlot slots[CMD_LATENCY_WINDOW_1M_SLOTS];
++} commandLatencyWindow;
++
++typedef struct {
++    long long microseconds;
++    long long calls;           /* calls with measured execution latency; rejected/deferred errors excluded */
++    long long rejected_calls;
++    long long failed_calls;
++    long long usec_min;
++    long long usec_max;
++    commandLatencyWindow latency_window;
++    struct hdr_histogram *latency_histogram;
++    struct hdr_histogram *latency_histogram_1m;
++    /* Last histogram allocation/reset timestamp.
++     * When histogram is NULL: serves as allocation-retry cooldown timestamp
++     *   (if non-zero, do not retry within 120 seconds).
++     * When histogram is non-NULL: marks when the 120-second tumbling window
++     *   started; histogram is discarded when (now - this) >= 120. */
++    long long latency_histogram_1m_reset_time;
++} commandLatencyAggregate;
++
++/*
++ * Per-command extended latency data -- packed into a single struct so
++ * struct redisCommand only needs ONE extra field for the whole feature,
++ * making porting to Redis 4/5/6 much simpler (add one field instead of seven).
++ *
++ * Lifecycle:
++ *   - At server init:    initCommandTrackingFields() calls
++ *                         initCommandExtendedTracking() for each native command.
++ *   - Module cmd create:  moduleCreateCommandProxy() calls
++ *                         initCommandExtendedTracking().
++ *   - At runtime:         histograms lazily allocated on first record.
++ *   - At CONFIG SET:      applyCommandLatencyTrackingConfig() calls
++ *                         resetCommandExtendedTrackingRecursive() -- frees
++ *                         histograms (both enable->disable AND disable->enable).
++ *   - At RESETSTAT:       resetCommandTableStats() calls non-recursive
++ *                         resetCommandExtendedTracking() while itself walking
++ *                         the command table recursively.
++ *   - At module unload:   moduleUnregisterCommands() calls
++ *                         resetCommandExtendedTrackingRecursive().
++ *   - At shutdown:        process exit reclaims memory (typical for Redis).
++ *
++ * Memory: ~82.4 KiB per command when both histograms are allocated
++ *         (2.4KB window + ~40KB all-time histogram + ~40KB 1m histogram).
++ *         For ~400 commands: ~32 MiB total when fully active.
++ */
++typedef struct {
++    long long usec_min;
++    long long usec_max;
++    long long latency_samples;
++    commandLatencyWindow latency_window;
++    struct hdr_histogram *latency_histogram_all;
++    struct hdr_histogram *latency_histogram_1m;
++    long long latency_histogram_1m_reset_time; /* see commandLatencyAggregate above */
++} commandLatencyExtData;
++
++/* --------------------------------------------------------------------------
++ * Core API -- recording
++ * -------------------------------------------------------------------------- */
++
++/*
++ * updateCommandExtendedLatencyStats -- records latency for commands that
++ *   actually executed (including commands that returned errors).
++ *   Updates: per-cmd min/max/usec, histogram_all, histogram_1m, ring buffer,
++ *            and 2 aggregate categories (all + r/w/o).
++ *   Does NOT touch rejected_calls / failed_calls -- those are handled by
++ *   updateCommandAggregateError (see below). The two functions have
++ *   completely disjoint responsibilities and CAN be called together
++ *   safely -- no double counting.
++ */
++void updateCommandExtendedLatencyStats(struct redisCommand *cmd, long long duration_us);
++
++/*
++ * updateCommandAggregateError -- records a failed/rejected command on the
++ *   aggregate categories only. Does NOT touch calls, microseconds, or
++ *   any latency fields (no double counting with updateCommandExtendedLatencyStats).
++ *
++ *   is_rejected: 1 = rejected_calls++,   0 = failed_calls++
++ *
++ *   For normal error commands in call(), updateCommandExtendedLatencyStats
++ *   is also called afterwards to record the command's latency. For "deferred
++ *   error" commands (dummy_error path that never actually executed), only
++ *   updateCommandAggregateError is called -- no latency to record.
++ */
++void updateCommandAggregateError(struct redisCommand *cmd, int is_rejected);
++
++/* --------------------------------------------------------------------------
++ * Core API -- reset / init
++ * -------------------------------------------------------------------------- */
++
++void resetCommandLatencyWindow(commandLatencyWindow *window);
++void resetCommandLatencyAggregate(commandLatencyAggregate *aggr);
++void resetCommandExtendedTracking(struct redisCommand *c);
++void resetCommandExtendedTrackingRecursive(struct redisCommand *c);
++void initCommandExtendedTracking(struct redisCommand *c);
++int applyCommandLatencyTrackingConfig(const char **err);
++void initCommandLatencyTracking(void);
++
++/* --------------------------------------------------------------------------
++ * Core API -- INFO output
++ * -------------------------------------------------------------------------- */
++
++void computeCommandLatencyWindowStats(commandLatencyWindow *window, int window_slots,
++                                       long long *calls, long long *sum_usec,
++                                       long long *min_usec, long long *max_usec);
++sds formatCommandLatencyExtendedStats(sds info, struct redisCommand *cmd);
++sds formatAggregateLatencyStats(sds info, const char *name,
++                                 commandLatencyAggregate *aggr);
++
++/*
++ * Returns 1 if per-command lines should include extended fields and
++ * aggregate category lines should be appended.  The caller still owns
++ * the decision of WHEN to call the formatting helpers -- typically
++ * from genRedisInfoStringCommandStats only when this returns true.
++ */
++int commandLatencyTrackingIsEnabled(void);
++int commandLatencyAggregateHasData(commandLatencyAggregate *aggr);
++
++/* --------------------------------------------------------------------------
++ * Macro wrappers -- reduce coupling at call sites for portability.
++ *
++ * Use these macros instead of calling the functions directly in main-path
++ * code (server.c, blocked.c, etc.).  They encapsulate the enabled-check
++ * and can be redefined as no-ops when porting to older Redis versions.
++ * -------------------------------------------------------------------------- */
++
++#define CMD_LATENCY_STATS_UPDATE(cmd, duration)                               \
++    do {                                                                      \
++        if (unlikely(server.command_latency_tracking_enabled))                \
++            updateCommandExtendedLatencyStats(cmd, duration);                 \
++    } while (0)
++
++#define CMD_LATENCY_ERROR_UPDATE(cmd, is_rejected)                            \
++    do {                                                                      \
++        if (unlikely(server.command_latency_tracking_enabled))                \
++            updateCommandAggregateError(cmd, is_rejected);                    \
++    } while (0)
++
++#endif /* __CMD_LATENCY_EXT_H */
+diff --git a/src/config.c b/src/config.c
+index 0814768b9..acb20c3c5 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -214,6 +214,10 @@ void loadServerConfigFromString(char *config) {
+             }
+         } else if (!strcasecmp(argv[0],"protected-mode") && argc == 2) {
+             if ((server.protected_mode = yesnotoi(argv[1])) == -1) {
++        } else if (!strcasecmp(argv[0],"command-latency-tracking") && argc == 2) {
++            if ((server.command_latency_tracking_enabled = yesnotoi(argv[1])) == -1) {
++                err = "argument must be 'yes' or 'no'"; goto loaderr;
++            }
+                 err = "argument must be 'yes' or 'no'"; goto loaderr;
+             }
+         } else if (!strcasecmp(argv[0],"port") && argc == 2) {
+@@ -969,6 +973,21 @@ void configSetCommand(client *c) {
+                 return;
+             }
+         }
++    } config_set_bool_field("command-latency-tracking", server.command_latency_tracking_enabled) {
++        if (server.command_latency_tracking_prev_enabled != server.command_latency_tracking_enabled
++            && server.command_latency_tracking_prev_enabled != -1) {
++            /* value changed: reset extended tracking */
++            dictIterator *di = dictGetSafeIterator(server.commands);
++            dictEntry *de;
++            while ((de = dictNext(di)) != NULL)
++                resetCommandExtendedTrackingRecursive(dictGetVal(de));
++            dictReleaseIterator(di);
++            resetCommandLatencyAggregate(&server.cmd_latency_aggr_all);
++            resetCommandLatencyAggregate(&server.cmd_latency_aggr_read);
++            resetCommandLatencyAggregate(&server.cmd_latency_aggr_write);
++            resetCommandLatencyAggregate(&server.cmd_latency_aggr_other);
++        }
++        server.command_latency_tracking_prev_enabled = server.command_latency_tracking_enabled;
+     } config_set_special_field("save") {
+         int vlen, j;
+         sds *v = sdssplitlen(o->ptr,sdslen(o->ptr)," ",1,&vlen);
+@@ -1426,6 +1445,7 @@ void configGetCommand(client *c) {
+             server.cluster_slave_no_failover);
+     config_get_bool_field("no-appendfsync-on-rewrite",
+             server.aof_no_fsync_on_rewrite);
++    config_get_bool_field("command-latency-tracking", server.command_latency_tracking_enabled);
+     config_get_bool_field("slave-serve-stale-data",
+             server.repl_serve_stale_data);
+     config_get_bool_field("replica-serve-stale-data",
+@@ -2145,6 +2165,7 @@ int rewriteConfig(char *path) {
+     rewriteConfigYesNoOption(state,"stop-writes-on-bgsave-error",server.stop_writes_on_bgsave_err,CONFIG_DEFAULT_STOP_WRITES_ON_BGSAVE_ERROR);
+     rewriteConfigYesNoOption(state,"rdbcompression",server.rdb_compression,CONFIG_DEFAULT_RDB_COMPRESSION);
+     rewriteConfigYesNoOption(state,"rdbchecksum",server.rdb_checksum,CONFIG_DEFAULT_RDB_CHECKSUM);
++    rewriteConfigYesNoOption(state,"command-latency-tracking",server.command_latency_tracking_enabled,0);
+     rewriteConfigStringOption(state,"dbfilename",server.rdb_filename,CONFIG_DEFAULT_RDB_FILENAME);
+     rewriteConfigDirOption(state);
+     rewriteConfigSlaveofOption(state,"replicaof");
+diff --git a/src/module.c b/src/module.c
+index 521807141..3ce3b5b2f 100644
+--- a/src/module.c
++++ b/src/module.c
+@@ -766,6 +766,9 @@ int RM_CreateCommand(RedisModuleCtx *ctx, const char *name, RedisModuleCmdFunc c
+     cp->rediscmd->keystep = keystep;
+     cp->rediscmd->microseconds = 0;
+     cp->rediscmd->calls = 0;
++    cp->rediscmd->rejected_calls = 0;
++    cp->rediscmd->failed_calls = 0;
++    initCommandExtendedTracking(cp->rediscmd);
+     dictAdd(server.commands,sdsdup(cmdname),cp->rediscmd);
+     dictAdd(server.orig_commands,sdsdup(cmdname),cp->rediscmd);
+     return REDISMODULE_OK;
+diff --git a/src/server.c b/src/server.c
+index 4d5c70236..db7d487b0 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -1711,9 +1711,15 @@ void initServerConfig(void) {
+     /* Command table -- we initiialize it here as it is part of the
+      * initial configuration, since command names may be changed via
+      * redis.conf using the rename-command directive. */
+-    server.commands = dictCreate(&commandTableDictType,NULL);
++    memset(&server.cmd_latency_aggr_all, 0, sizeof(server.cmd_latency_aggr_all));
++    memset(&server.cmd_latency_aggr_read, 0, sizeof(server.cmd_latency_aggr_read));
++    memset(&server.cmd_latency_aggr_write, 0, sizeof(server.cmd_latency_aggr_write));
++    memset(&server.cmd_latency_aggr_other, 0, sizeof(server.cmd_latency_aggr_other));
++    server.command_latency_tracking_prev_enabled = -1;
++        server.commands = dictCreate(&commandTableDictType,NULL);
+     server.orig_commands = dictCreate(&commandTableDictType,NULL);
+     populateCommandTable();
++    initCommandLatencyTracking();
+     server.delCommand = lookupCommandByCString("del");
+     server.multiCommand = lookupCommandByCString("multi");
+     server.lpushCommand = lookupCommandByCString("lpush");
+@@ -2262,6 +2268,9 @@ void resetCommandTableStats(void) {
+         c = (struct redisCommand *) dictGetVal(de);
+         c->microseconds = 0;
+         c->calls = 0;
++        c->rejected_calls = 0;
++        c->failed_calls = 0;
++        resetCommandExtendedTracking(c);
+     }
+     dictReleaseIterator(di);
+ 
+@@ -2509,6 +2518,7 @@ void call(client *c, int flags) {
+          * EXPIRE, GEOADD, etc. */
+         real_cmd->microseconds += duration;
+         real_cmd->calls++;
++        CMD_LATENCY_STATS_UPDATE(real_cmd, duration);
+     }
+ 
+     /* Propagate the command into the AOF and replication link */
+@@ -2610,7 +2620,9 @@ int processCommand(client *c) {
+         return C_OK;
+     } else if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) ||
+                (c->argc < -c->cmd->arity)) {
++        c->cmd->rejected_calls++;
+         flagTransaction(c);
++        CMD_LATENCY_ERROR_UPDATE(c->cmd, 1);
+         addReplyErrorFormat(c,"wrong number of arguments for '%s' command",
+             c->cmd->name);
+         return C_OK;
+@@ -3654,13 +3666,29 @@ sds genRedisInfoString(char *section) {
+         di = dictGetSafeIterator(server.commands);
+         while((de = dictNext(di)) != NULL) {
+             c = (struct redisCommand *) dictGetVal(de);
+-            if (!c->calls) continue;
++            if (!c->calls && !c->failed_calls && !c->rejected_calls) continue;
+             info = sdscatprintf(info,
+-                "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f\r\n",
++                "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
++                ",rejected_calls=%lld,failed_calls=%lld",
+                 c->name, c->calls, c->microseconds,
+-                (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
++                (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
++                c->rejected_calls, c->failed_calls);
++            if (commandLatencyTrackingIsEnabled()) {
++                info = formatCommandLatencyExtendedStats(info, c);
++            }
++            info = sdscat(info, "\r\n");
+         }
+         dictReleaseIterator(di);
++        if (commandLatencyTrackingIsEnabled()) {
++            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_all))
++                info = formatAggregateLatencyStats(info, "-", &server.cmd_latency_aggr_all);
++            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_read))
++                info = formatAggregateLatencyStats(info, "r", &server.cmd_latency_aggr_read);
++            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_write))
++                info = formatAggregateLatencyStats(info, "w", &server.cmd_latency_aggr_write);
++            if (commandLatencyAggregateHasData(&server.cmd_latency_aggr_other))
++                info = formatAggregateLatencyStats(info, "o", &server.cmd_latency_aggr_other);
++        }
+     }
+ 
+     /* Cluster */
+diff --git a/src/server.h b/src/server.h
+index 5371c303b..901752334 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -63,6 +63,7 @@ typedef long long ustime_t; /* microsecond time type. */
+ #include "version.h" /* Version macro */
+ #include "util.h"    /* Misc functions useful in many places */
+ #include "latency.h" /* Latency monitor API */
++#include "cmd_latency_ext.h"
+ #include "sparkline.h" /* ASCII graphs API */
+ #include "quicklist.h"  /* Lists are encoded as linked lists of
+                            N-elements flat arrays */
+@@ -1015,6 +1016,12 @@ struct redisServer {
+     /* Fields used only for stats */
+     time_t stat_starttime;          /* Server start time */
+     long long stat_numcommands;     /* Number of processed commands */
++    int command_latency_tracking_enabled;
++    int command_latency_tracking_prev_enabled;
++    commandLatencyAggregate cmd_latency_aggr_all;
++    commandLatencyAggregate cmd_latency_aggr_read;
++    commandLatencyAggregate cmd_latency_aggr_write;
++    commandLatencyAggregate cmd_latency_aggr_other;
+     long long stat_numconnections;  /* Number of connections received */
+     long long stat_expiredkeys;     /* Number of expired keys */
+     double stat_expired_stale_perc; /* Percentage of keys probably expired */
+@@ -1325,6 +1332,8 @@ struct redisCommand {
+     int lastkey;  /* The last argument that's a key */
+     int keystep;  /* The step between first and last key */
+     long long microseconds, calls;
++    commandLatencyExtData latency_ext;
++    long long rejected_calls, failed_calls;
+ };
+ 
+ struct redisFunctionSym {
+-- 
+2.43.0
+
